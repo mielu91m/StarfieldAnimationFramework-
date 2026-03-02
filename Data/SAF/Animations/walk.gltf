@@ -1,0 +1,441 @@
+﻿{
+    "nodes":  [
+                  {
+                      "name":  "C_Spine",
+                      "rotation":  [
+                                       0,
+                                       0,
+                                       0,
+                                       1
+                                   ]
+                  },
+                  {
+                      "name":  "C_Spine2",
+                      "rotation":  [
+                                       0,
+                                       0,
+                                       0,
+                                       1
+                                   ]
+                  },
+                  {
+                      "name":  "C_Chest",
+                      "rotation":  [
+                                       0,
+                                       0,
+                                       0,
+                                       1
+                                   ]
+                  },
+                  {
+                      "name":  "L_Thigh",
+                      "rotation":  [
+                                       0,
+                                       0,
+                                       0,
+                                       1
+                                   ]
+                  },
+                  {
+                      "name":  "R_Thigh",
+                      "rotation":  [
+                                       0,
+                                       0,
+                                       0,
+                                       1
+                                   ]
+                  },
+                  {
+                      "name":  "L_Calf",
+                      "rotation":  [
+                                       0,
+                                       0,
+                                       0,
+                                       1
+                                   ]
+                  },
+                  {
+                      "name":  "R_Calf",
+                      "rotation":  [
+                                       0,
+                                       0,
+                                       0,
+                                       1
+                                   ]
+                  },
+                  {
+                      "name":  "L_Clavicle",
+                      "rotation":  [
+                                       0,
+                                       0,
+                                       0,
+                                       1
+                                   ]
+                  },
+                  {
+                      "name":  "L_Biceps",
+                      "rotation":  [
+                                       0,
+                                       0,
+                                       0,
+                                       1
+                                   ]
+                  },
+                  {
+                      "name":  "R_Clavicle",
+                      "rotation":  [
+                                       0,
+                                       0,
+                                       0,
+                                       1
+                                   ]
+                  },
+                  {
+                      "name":  "R_Biceps",
+                      "rotation":  [
+                                       0,
+                                       0,
+                                       0,
+                                       1
+                                   ]
+                  },
+                  {
+                      "name":  "C_Head",
+                      "rotation":  [
+                                       0,
+                                       0,
+                                       0,
+                                       1
+                                   ]
+                  }
+              ],
+    "bufferViews":  [
+                        {
+                            "byteLength":  20,
+                            "byteOffset":  0,
+                            "buffer":  0
+                        },
+                        {
+                            "byteLength":  80,
+                            "byteOffset":  20,
+                            "buffer":  0
+                        },
+                        {
+                            "byteLength":  80,
+                            "byteOffset":  100,
+                            "buffer":  0
+                        },
+                        {
+                            "byteLength":  80,
+                            "byteOffset":  180,
+                            "buffer":  0
+                        },
+                        {
+                            "byteLength":  80,
+                            "byteOffset":  260,
+                            "buffer":  0
+                        },
+                        {
+                            "byteLength":  80,
+                            "byteOffset":  340,
+                            "buffer":  0
+                        },
+                        {
+                            "byteLength":  80,
+                            "byteOffset":  420,
+                            "buffer":  0
+                        },
+                        {
+                            "byteLength":  80,
+                            "byteOffset":  500,
+                            "buffer":  0
+                        },
+                        {
+                            "byteLength":  80,
+                            "byteOffset":  580,
+                            "buffer":  0
+                        },
+                        {
+                            "byteLength":  80,
+                            "byteOffset":  660,
+                            "buffer":  0
+                        },
+                        {
+                            "byteLength":  80,
+                            "byteOffset":  740,
+                            "buffer":  0
+                        },
+                        {
+                            "byteLength":  80,
+                            "byteOffset":  820,
+                            "buffer":  0
+                        },
+                        {
+                            "byteLength":  80,
+                            "byteOffset":  900,
+                            "buffer":  0
+                        }
+                    ],
+    "asset":  {
+                  "version":  "2.0",
+                  "generator":  "SAF create_walk_animation.ps1"
+              },
+    "accessors":  [
+                      {
+                          "count":  5,
+                          "bufferView":  0,
+                          "type":  "SCALAR",
+                          "componentType":  5126
+                      },
+                      {
+                          "count":  5,
+                          "bufferView":  1,
+                          "type":  "VEC4",
+                          "componentType":  5126
+                      },
+                      {
+                          "count":  5,
+                          "bufferView":  2,
+                          "type":  "VEC4",
+                          "componentType":  5126
+                      },
+                      {
+                          "count":  5,
+                          "bufferView":  3,
+                          "type":  "VEC4",
+                          "componentType":  5126
+                      },
+                      {
+                          "count":  5,
+                          "bufferView":  4,
+                          "type":  "VEC4",
+                          "componentType":  5126
+                      },
+                      {
+                          "count":  5,
+                          "bufferView":  5,
+                          "type":  "VEC4",
+                          "componentType":  5126
+                      },
+                      {
+                          "count":  5,
+                          "bufferView":  6,
+                          "type":  "VEC4",
+                          "componentType":  5126
+                      },
+                      {
+                          "count":  5,
+                          "bufferView":  7,
+                          "type":  "VEC4",
+                          "componentType":  5126
+                      },
+                      {
+                          "count":  5,
+                          "bufferView":  8,
+                          "type":  "VEC4",
+                          "componentType":  5126
+                      },
+                      {
+                          "count":  5,
+                          "bufferView":  9,
+                          "type":  "VEC4",
+                          "componentType":  5126
+                      },
+                      {
+                          "count":  5,
+                          "bufferView":  10,
+                          "type":  "VEC4",
+                          "componentType":  5126
+                      },
+                      {
+                          "count":  5,
+                          "bufferView":  11,
+                          "type":  "VEC4",
+                          "componentType":  5126
+                      },
+                      {
+                          "count":  5,
+                          "bufferView":  12,
+                          "type":  "VEC4",
+                          "componentType":  5126
+                      }
+                  ],
+    "scenes":  [
+                   {
+                       "nodes":  [
+                                     0,
+                                     1,
+                                     2,
+                                     3,
+                                     4,
+                                     5,
+                                     6,
+                                     7,
+                                     8,
+                                     9,
+                                     10,
+                                     11
+                                 ]
+                   }
+               ],
+    "buffers":  [
+                    {
+                        "uri":  "data:application/octet-stream;base64,AAAAAAAAgD4AAAA/AABAPwAAgD8AAAAAAAAAAAAAAAAAAIA/28sjPQAAAAAAAAAAlMt/P1K4tCIAAAAAAAAAAAAAgD/byyO9AAAAAAAAAACUy38/Urg0owAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgD8+1KM8AAAAAAAAAADl8n8/Urg0IgAAAAAAAAAAAACAPz7Uo7wAAAAAAAAAAOXyfz9SuLSiAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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",
+                        "byteLength":  3860
+                    }
+                ],
+    "scene":  0,
+    "animations":  [
+                       {
+                           "channels":  [
+                                            {
+                                                "target":  {
+                                                               "node":  0,
+                                                               "path":  "rotation"
+                                                           },
+                                                "sampler":  0
+                                            },
+                                            {
+                                                "target":  {
+                                                               "node":  1,
+                                                               "path":  "rotation"
+                                                           },
+                                                "sampler":  1
+                                            },
+                                            {
+                                                "target":  {
+                                                               "node":  2,
+                                                               "path":  "rotation"
+                                                           },
+                                                "sampler":  2
+                                            },
+                                            {
+                                                "target":  {
+                                                               "node":  3,
+                                                               "path":  "rotation"
+                                                           },
+                                                "sampler":  3
+                                            },
+                                            {
+                                                "target":  {
+                                                               "node":  4,
+                                                               "path":  "rotation"
+                                                           },
+                                                "sampler":  4
+                                            },
+                                            {
+                                                "target":  {
+                                                               "node":  5,
+                                                               "path":  "rotation"
+                                                           },
+                                                "sampler":  5
+                                            },
+                                            {
+                                                "target":  {
+                                                               "node":  6,
+                                                               "path":  "rotation"
+                                                           },
+                                                "sampler":  6
+                                            },
+                                            {
+                                                "target":  {
+                                                               "node":  7,
+                                                               "path":  "rotation"
+                                                           },
+                                                "sampler":  7
+                                            },
+                                            {
+                                                "target":  {
+                                                               "node":  8,
+                                                               "path":  "rotation"
+                                                           },
+                                                "sampler":  8
+                                            },
+                                            {
+                                                "target":  {
+                                                               "node":  9,
+                                                               "path":  "rotation"
+                                                           },
+                                                "sampler":  9
+                                            },
+                                            {
+                                                "target":  {
+                                                               "node":  10,
+                                                               "path":  "rotation"
+                                                           },
+                                                "sampler":  10
+                                            },
+                                            {
+                                                "target":  {
+                                                               "node":  11,
+                                                               "path":  "rotation"
+                                                           },
+                                                "sampler":  11
+                                            }
+                                        ],
+                           "name":  "walk",
+                           "samplers":  [
+                                            {
+                                                "input":  0,
+                                                "interpolation":  "LINEAR",
+                                                "output":  1
+                                            },
+                                            {
+                                                "input":  0,
+                                                "interpolation":  "LINEAR",
+                                                "output":  2
+                                            },
+                                            {
+                                                "input":  0,
+                                                "interpolation":  "LINEAR",
+                                                "output":  3
+                                            },
+                                            {
+                                                "input":  0,
+                                                "interpolation":  "LINEAR",
+                                                "output":  4
+                                            },
+                                            {
+                                                "input":  0,
+                                                "interpolation":  "LINEAR",
+                                                "output":  5
+                                            },
+                                            {
+                                                "input":  0,
+                                                "interpolation":  "LINEAR",
+                                                "output":  6
+                                            },
+                                            {
+                                                "input":  0,
+                                                "interpolation":  "LINEAR",
+                                                "output":  7
+                                            },
+                                            {
+                                                "input":  0,
+                                                "interpolation":  "LINEAR",
+                                                "output":  8
+                                            },
+                                            {
+                                                "input":  0,
+                                                "interpolation":  "LINEAR",
+                                                "output":  9
+                                            },
+                                            {
+                                                "input":  0,
+                                                "interpolation":  "LINEAR",
+                                                "output":  10
+                                            },
+                                            {
+                                                "input":  0,
+                                                "interpolation":  "LINEAR",
+                                                "output":  11
+                                            },
+                                            {
+                                                "input":  0,
+                                                "interpolation":  "LINEAR",
+                                                "output":  12
+                                            }
+                                        ]
+                       }
+                   ]
+}
