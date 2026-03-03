@@ -21,6 +21,7 @@
 #include "RE/B/BSTEvent.h"
 #include "RE/P/PlayerCamera.h"
 #include "RE/U/UIMessageQueue.h"
+#include "RE/U/UI.h"
 #include <ozz/animation/offline/animation_builder.h>
 #include <ozz/animation/runtime/animation.h>
 #include <ozz/animation/runtime/sampling_job.h>
@@ -110,6 +111,10 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 	// 1 = NAF-like apply: ignoruj rest/game_base, użyj bezpośrednio macierzy z animacji (jak Graph::PushAnimationOutput w NAF).
 	// Zakładamy, że animacja jest już w tym samym układzie co szkielet gry (Z-up). Domyślnie bez YUpToZUpConversion.
 	static std::atomic<bool> g_useNAFApplyMode{ false };
+	// 1 = pozwól animacji sterować kośćmi twarzy (Eye/Jaw/faceBone_*). 0 = zostaw pod grą (FaceGen/morphy).
+	static std::atomic<bool> g_animateFaceJoints{ false };
+	// Siła miksu twarzy: 0.0 = tylko gra, 1.0 = tylko animacja, wartości pośrednie = blend.
+	static std::atomic<float> g_faceAnimStrength{ 0.0f };
 	// 0 = off, 1..4 = prosta poprawka osi dla kręgosłupa i nóg (Spine/Legs) po wyliczeniu macierzy:
 	// 1: R*Rx(+90°), 2: R*Rx(-90°), 3: R*Ry(+90°), 4: R*Ry(-90°).
 	static std::atomic<int> g_spineLegsSimpleAxisFix{ 0 };
@@ -280,6 +285,20 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 			const bool enabled = ParseBool(value, true);
 			g_menuHookEnabled.store(enabled, std::memory_order_release);
 			SAF_LOG_INFO("MenuHook enabled: {}", enabled ? "true" : "false");
+		} else if (key == "AnimateFaceJoints") {
+			const bool enabled = ParseBool(value, false);
+			g_animateFaceJoints.store(enabled, std::memory_order_release);
+			SAF_LOG_INFO("AnimateFaceJoints: {}", enabled ? "true" : "false");
+		} else if (key == "FaceAnimationStrength") {
+			try {
+				float v = std::stof(std::string(Trim(value)));
+				if (v < 0.0f) v = 0.0f;
+				if (v > 1.0f) v = 1.0f;
+				g_faceAnimStrength.store(v, std::memory_order_release);
+				SAF_LOG_INFO("FaceAnimationStrength: {}", v);
+			} catch (...) {
+				SAF_LOG_WARN("FaceAnimationStrength invalid in ini: {}", value);
+			}
 		} else if (key == "ApplyYUpToZUpConversion") {
 			const bool enabled = ParseBool(value, true);
 			g_applyYUpToZUpConversion.store(enabled, std::memory_order_release);
@@ -557,6 +576,8 @@ static std::vector<std::unique_ptr<REL::THookVFT<void(RE::PlayerCamera*)>>> g_pl
 static bool g_playerCameraHookInstalled = false;
 static REL::THookVFT<RE::UI_MESSAGE_RESULT(RE::IMenu*, RE::UIMessageData&)>* g_menuProcessMessageHookPrimary = nullptr;
 static std::vector<std::unique_ptr<REL::THookVFT<RE::UI_MESSAGE_RESULT(RE::IMenu*, RE::UIMessageData&)>>> g_menuProcessMessageHooks;
+// Map vtable address -> hook; wywołanie oryginału tylko dla właściwego menu (unika CTD przy help / innych komendach).
+static std::unordered_map<uintptr_t, REL::THookVFT<RE::UI_MESSAGE_RESULT(RE::IMenu*, RE::UIMessageData&)>*> g_menuVtableToHook;
 static bool g_menuProcessMessageHookInstalled = false;
 static bool g_updateSceneRectSinkInstalled = false;
 static bool g_playerUpdateSinkInstalled = false;
@@ -1192,12 +1213,28 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		}
 		return false;
 	}
-	// Kości dłoni i twarzy – w trybie NAF nie nadpisujemy, żeby gra sterowała (IK, morphy). Head/Neck zostawiamy – animacja głowy/szyi ma działać.
-	// Pomijamy: palce, Wrist (dłonie), Eye, Jaw (jeśli jest w szkielecie). Usta/broda w Starfieldzie to często morphy (BSFaceGen), nie kość.
-	static bool IsHandOrFaceJoint(const char* a_name)
+	// Kości dłoni – w trybie NAF nie nadpisujemy, żeby gra sterowała (IK). Zostają pod grą niezależnie od AnimateFaceJoints.
+	static bool IsHandJoint(const char* a_name)
 	{
 		if (!a_name || !*a_name) return false;
-		const char* sub[] = { "Cup", "Thumb", "Index", "Middle", "Ring", "Pinky", "Eye", "Wrist", "Jaw", nullptr };
+		const char* sub[] = { "Cup", "Thumb", "Index", "Middle", "Ring", "Pinky", "Wrist", nullptr };
+		for (int h = 0; sub[h]; ++h) {
+			const char* subStr = sub[h];
+			const char* p = a_name;
+			while (*p) {
+				const char* q = p, * s = subStr;
+				while (*q && *s && std::tolower(static_cast<unsigned char>(*q)) == std::tolower(static_cast<unsigned char>(*s))) { ++q; ++s; }
+				if (!*s) return true;
+				++p;
+			}
+		}
+		return false;
+	}
+	// Kości twarzy – Eye, Jaw, faceBone_* (usta/policzki/broda). Możemy nimi sterować z animacji, jeśli AnimateFaceJoints=1.
+	static bool IsFaceJoint(const char* a_name)
+	{
+		if (!a_name || !*a_name) return false;
+		const char* sub[] = { "Eye", "Jaw", "faceBone", nullptr };
 		for (int h = 0; sub[h]; ++h) {
 			const char* subStr = sub[h];
 			const char* p = a_name;
@@ -2304,9 +2341,15 @@ static RE::UI_MESSAGE_RESULT IMenuProcessMessageHook(RE::IMenu* a_menu, RE::UIMe
 	static std::atomic<uint32_t> callCount{ 0 };
 	const uint32_t callNum = ++callCount;
 
+	// Wywołaj oryginał TYLKO gdy znamy vtable tego menu – nigdy „primary” z innego menu (CTD przy help / additem).
 	RE::UI_MESSAGE_RESULT result = RE::UI_MESSAGE_RESULT::kPassOn;
-	if (g_menuProcessMessageHookPrimary) {
-		result = (*g_menuProcessMessageHookPrimary)(a_menu, a_message);
+	if (a_menu && !g_menuVtableToHook.empty()) {
+		const uintptr_t menuVtable = *reinterpret_cast<uintptr_t*>(a_menu);
+		auto it = g_menuVtableToHook.find(menuVtable);
+		if (it != g_menuVtableToHook.end() && it->second) {
+			result = (*(it->second))(a_menu, a_message);
+		}
+		// Nie wywołuj g_menuProcessMessageHookPrimary gdy nie ma dopasowania – to byłby zły oryginał.
 	}
 
 	const DWORD curThread = GetCurrentThreadId();
@@ -2321,6 +2364,17 @@ static RE::UI_MESSAGE_RESULT IMenuProcessMessageHook(RE::IMenu* a_menu, RE::UIMe
 
 	if (a_message.type != RE::UI_MESSAGE_TYPE::kUpdate) {
 		return result;
+	}
+
+	// Gdy otwarta konsola lub menu kreatora – nie uruchamiamy UpdateGraphs ani kolejek (unika CTD przy help / additem).
+	const char* menuName = a_menu ? a_menu->GetName() : nullptr;
+	if (menuName) {
+		if (std::strstr(menuName, "CharGen") || std::strstr(menuName, "Look") || std::strstr(menuName, "Face")) {
+			return result;
+		}
+		if (std::strstr(menuName, "Console")) {
+			return result;
+		}
 	}
 
 	auto* mgr = GraphManager::GetSingleton();
@@ -2674,15 +2728,18 @@ static bool InstallAnimGraphManagerCallHook()
 
 	if (g_menuHookEnabled.load(std::memory_order_acquire) && !g_menuProcessMessageHookInstalled) {
 		constexpr std::size_t kProcessMessageIndex = 8;
+		g_menuVtableToHook.clear();
 		for (const auto id : RE::VTABLE::IMenu) {
 			auto hook = std::make_unique<REL::THookVFT<RE::UI_MESSAGE_RESULT(RE::IMenu*, RE::UIMessageData&)>>(
 				id, kProcessMessageIndex, &IMenuProcessMessageHook);
 			if (hook->Enable()) {
+				const uintptr_t vtableAddr = id.address();
+				g_menuVtableToHook[vtableAddr] = hook.get();
 				if (!g_menuProcessMessageHookPrimary) {
 					g_menuProcessMessageHookPrimary = hook.get();
 				}
 				g_menuProcessMessageHooks.emplace_back(std::move(hook));
-				SAF_LOG_INFO("IMenu::ProcessMessage VFT hook enabled (VTABLE ID {})", id.id());
+				SAF_LOG_INFO("IMenu::ProcessMessage VFT hook enabled (VTABLE ID {}, vtable={:X})", id.id(), vtableAddr);
 			}
 		}
 		g_menuProcessMessageHookInstalled = !g_menuProcessMessageHooks.empty();
@@ -3046,15 +3103,26 @@ bool GraphManager::ShouldDeferHookInstall() const
 
 	void GraphManager::UpdateGraphs(float a_deltaSeconds)
 	{
-	const DWORD curThread = GetCurrentThreadId();
-	if (g_mainThreadId == 0 && curThread != 0) {
-		g_mainThreadId = curThread;
-		SAF_LOG_INFO("GraphManager: main thread id set to {} (UpdateGraphs self-healing)", g_mainThreadId);
-	}
-	if (!IsMainThread()) {
-		return;
-	}
-	std::lock_guard<std::mutex> lock(g_graphMutex);
+		const DWORD curThread = GetCurrentThreadId();
+		if (g_mainThreadId == 0 && curThread != 0) {
+			g_mainThreadId = curThread;
+			SAF_LOG_INFO("GraphManager: main thread id set to {} (UpdateGraphs self-healing)", g_mainThreadId);
+		}
+		if (!IsMainThread()) {
+			return;
+		}
+
+		// Gdy konsola lub menu edycji postaci – nie dotykaj grafów (unika CTD przy help / additem / showlooksmenu).
+		if (auto* ui = RE::UI::GetSingleton()) {
+			if (ui->IsMenuOpen("CharGenMenu") || ui->IsMenuOpen("LooksMenu") || ui->IsMenuOpen("FaceMenu")) {
+				return;
+			}
+			if (ui->IsMenuOpen("Console")) {
+				return;
+			}
+		}
+
+		std::lock_guard<std::mutex> lock(g_graphMutex);
 		if (g_actorGraphs.empty()) {
 			static std::atomic<uint32_t> emptyGraphCount{ 0 };
 			uint32_t c = ++emptyGraphCount;
@@ -3269,14 +3337,21 @@ bool GraphManager::ShouldDeferHookInstall() const
 				}
 
 				const char* jointName = (i < state.skeleton->jointNames.size()) ? state.skeleton->jointNames[i].c_str() : nullptr;
-				// W trybie NAF nie piszemy do kości dłoni (palce, cup) i twarzy (Eye) – gra nimi steruje (IK, morphy); inaczej znikają ręce i psuje się twarz.
-				if (g_useNAFApplyMode.load(std::memory_order_acquire) && jointName && IsHandOrFaceJoint(jointName)) {
-					++skippedControlled;
-					continue;
+				// W trybie NAF nie piszemy do kości dłoni (palce, cup, Wrist) – gra nimi steruje (IK).
+				// Twarz (Eye/Jaw/faceBone_*) pomijamy tylko gdy AnimateFaceJoints=0 – gdy =1, pozwalamy animacji nadpisywać te kości.
+				if (g_useNAFApplyMode.load(std::memory_order_acquire) && jointName) {
+					if (IsHandJoint(jointName)) {
+						++skippedControlled;
+						continue;
+					}
+					if (!g_animateFaceJoints.load(std::memory_order_acquire) && IsFaceJoint(jointName)) {
+						++skippedControlled;
+						continue;
+					}
 				}
 
 				const auto& rest = (i < state.restTransforms.size())     ? state.restTransforms[i]         : kIdentRest;
-				const auto& anim = state.localTransforms[i];
+				Animation::Transform anim = state.localTransforms[i];
 				// Skip joints with no animation (anim == rest) only when not NAF mode – w NAF piszemy do wszystkich kości co klatkę, żeby po kilku sekundach nie wyginało (gra nie nadpisuje części kości).
 				if (g_applyOnlyToAnimatedJoints.load(std::memory_order_acquire) && !g_useNAFApplyMode.load(std::memory_order_acquire) && !g_applyAnimRotationOnly.load(std::memory_order_acquire)) {
 					const float dot = anim.rotation.x * rest.rotation.x + anim.rotation.y * rest.rotation.y +
@@ -3286,6 +3361,37 @@ bool GraphManager::ShouldDeferHookInstall() const
 				}
 
 				const float* base = (i < state.gameBaseRotations.size()) ? state.gameBaseRotations[i].data() : kIdentBase;
+
+				// Blend twarzy: miksuj pozę gry z animacją tylko dla kości twarzy, gdy AnimateFaceJoints=1 i FaceAnimationStrength>0.
+				if (g_useNAFApplyMode.load(std::memory_order_acquire) &&
+					jointName && IsFaceJoint(jointName) &&
+					g_animateFaceJoints.load(std::memory_order_acquire)) {
+					const float w = g_faceAnimStrength.load(std::memory_order_acquire);
+					if (w > 0.0f) {
+						Animation::Transform gamePose;
+						if (ReadBoneFullTransform(state.jointNodes[i], g_niTransformOffset.load(std::memory_order_acquire), gamePose)) {
+							const float iw = 1.0f - w;
+							// nlerp (normalized lerp) quaternions: q = normalize( (1-w)*qGame + w*qAnim )
+							float qx = iw * gamePose.rotation.x + w * anim.rotation.x;
+							float qy = iw * gamePose.rotation.y + w * anim.rotation.y;
+							float qz = iw * gamePose.rotation.z + w * anim.rotation.z;
+							float qw = iw * gamePose.rotation.w + w * anim.rotation.w;
+							const float qlen2 = qx*qx + qy*qy + qz*qz + qw*qw;
+							if (qlen2 > 1e-8f) {
+								const float invLen = 1.0f / std::sqrt(qlen2);
+								qx *= invLen; qy *= invLen; qz *= invLen; qw *= invLen;
+								anim.rotation.x = qx;
+								anim.rotation.y = qy;
+								anim.rotation.z = qz;
+								anim.rotation.w = qw;
+							}
+							// Lerp translation: pos = (1-w)*game + w*anim
+							anim.translation.x = iw * gamePose.translation.x + w * anim.translation.x;
+							anim.translation.y = iw * gamePose.translation.y + w * anim.translation.y;
+							anim.translation.z = iw * gamePose.translation.z + w * anim.translation.z;
+						}
+					}
+				}
 
 				// ── FRAMEDUMP: first 6 frames + frames 30,60,90 for key bones ──────────────
 				if (jointName && (state.animFrameCount <= 6 || state.animFrameCount == 30 || state.animFrameCount == 60 || state.animFrameCount == 90)) {

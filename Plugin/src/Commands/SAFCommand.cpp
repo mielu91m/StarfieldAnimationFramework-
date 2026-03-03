@@ -285,6 +285,44 @@ namespace Commands::SAFCommand
 		}
 	}
 
+	// Aktualnie wybrane odniesienie w konsoli (prid / klik na obiekt). Wersja: 1.15.222.
+	// W try/catch – przy innej wersji gry lub zmodyfikowanej konsoli REL::ID mogą być nieaktualne.
+	static RE::TESObjectREFR* GetConsoleReference()
+	{
+		try {
+			static REL::Relocation<std::uint32_t*> handleReloc{ REL::ID(949615) };
+			if (auto handle = *handleReloc; handle) {
+				struct FormStruct {
+					std::uintptr_t lambdaPTR;
+					RE::TESForm*** formHolder;
+				};
+				using typeM = std::uintptr_t;
+				using typeF = bool(typeM, std::uint32_t, FormStruct*);
+				static REL::Relocation<typeM*> manager{ REL::ID(883285) };
+				static REL::Relocation<typeF*> function{ REL::ID(139363) };
+				static auto lambdaAddress = REL::ID(392398).address();
+				RE::TESForm* result = nullptr;
+				auto resultHolder = std::addressof(result);
+				FormStruct argument{ lambdaAddress, &resultHolder };
+				function(*manager, handle, &argument);
+				if (result) {
+					switch (result->GetFormType()) {
+					case RE::FormType::kREFR:
+					case RE::FormType::kACHR:
+						return reinterpret_cast<RE::TESObjectREFR*>(result);
+					default:
+						break;
+					}
+				}
+			}
+		} catch (const std::exception& e) {
+			SAF_LOG_WARN("[SAF] GetConsoleReference exception: {}", e.what());
+		} catch (...) {
+			SAF_LOG_WARN("[SAF] GetConsoleReference unknown exception");
+		}
+		return nullptr;
+	}
+
 	// Zwraca aktora po ref ID – jak NAF: HexStrToForm (ID w formacie konsoli), GetSelectedReference gdy brak ID.
 	// Dla "player"/"0"/"14": najpierw ref wybrana w konsoli (prid / klik), potem crosshair lub gracz.
 	static RE::Actor* GetActorByRefID(const std::string& a_actorId)
@@ -295,11 +333,17 @@ namespace Commands::SAFCommand
 
 		// NAF: jawny ref ID – rozwiązywanie przez HexStrToForm (format taki jak w konsoli).
 		if (itfc) {
-			MCF::simple_string_view sv(a_actorId.data(), a_actorId.size());
-			RE::TESForm* form = itfc->HexStrToForm(sv);
-			if (form) {
-				RE::Actor* actor = form->As<RE::Actor>();
-				if (actor) return actor;
+			try {
+				MCF::simple_string_view sv(a_actorId.data(), a_actorId.size());
+				RE::TESForm* form = itfc->HexStrToForm(sv);
+				if (form) {
+					RE::Actor* actor = form->As<RE::Actor>();
+					if (actor) return actor;
+				}
+			} catch (const std::exception& e) {
+				SAF_LOG_WARN("[SAF] HexStrToForm exception: {}", e.what());
+			} catch (...) {
+				SAF_LOG_WARN("[SAF] HexStrToForm unknown exception");
 			}
 		}
 
@@ -363,8 +407,37 @@ namespace Commands::SAFCommand
 
 	// Helper do konwersji typów MCF na std::string_view (data/size są członkami, nie metodami)
 	inline std::string_view ToSV(const MCF::simple_string_view& sv) {
+		if (!sv.data || sv.size == 0) return std::string_view();
 		return std::string_view(sv.data, sv.size);
 	}
+
+	// Bezpieczne wyjście do konsoli – unika crashy przy zmodyfikowanym MCF/INI lub .bat
+	static void SafePrintLn(MCF::ConsoleInterface* a_intfc, const char* a_txt)
+	{
+		if (!a_txt) return;
+		if (!a_intfc) return;
+		try {
+			a_intfc->PrintLn(MCF::simple_string_view(a_txt, std::strlen(a_txt)));
+		} catch (const std::exception& e) {
+			SAF_LOG_WARN("[SAF] SafePrintLn exception: {}", e.what());
+		} catch (...) {
+			SAF_LOG_WARN("[SAF] SafePrintLn unknown exception");
+		}
+	}
+	static void SafePrintLn(MCF::ConsoleInterface* a_intfc, const std::string& a_txt)
+	{
+		if (a_txt.empty() || !a_intfc) return;
+		try {
+			a_intfc->PrintLn(MCF::simple_string_view(a_txt.c_str(), a_txt.size()));
+		} catch (const std::exception& e) {
+			SAF_LOG_WARN("[SAF] SafePrintLn exception: {}", e.what());
+		} catch (...) {
+			SAF_LOG_WARN("[SAF] SafePrintLn unknown exception");
+		}
+	}
+
+	// Maks. liczba komend przetwarzanych w jednej klatce – zapobiega zawieszce przy .bat / wielu komendach
+	static constexpr size_t kMaxPendingCommandsPerFrame = 5;
 
 	static void CollectNodesIterative(RE::NiAVObject* a_root, std::vector<RE::NiAVObject*>& a_out)
 	{
@@ -404,25 +477,26 @@ namespace Commands::SAFCommand
 
 	void ShowHelp()
 	{
-		itfc->PrintLn("SAF (Starfield Animation Framework) Commands:");
-		itfc->PrintLn("saf play <path> [actorID] - Odtwarza animację na NPC lub graczu.");
-		itfc->PrintLn("  Cel: (1) Skieruj celownik na NPC, otwórz konsolę, wpisz: saf play tw");
-		itfc->PrintLn("  (2) Albo kliknij NPC w konsoli (widać ref ID), potem: saf play tw <refID> (np. 0x12345 lub decimal)");
-		itfc->PrintLn("saf stop [actorID] - Zatrzymuje animację SAF (domyślnie: NPC pod celownikiem lub gracz)");
-		itfc->PrintLn("saf optimize <file> [compression_level] - Optimizes GLTF to SAF");
-		itfc->PrintLn("saf dumpbones [actorID] - Dumps actor 3D bone hierarchy to Data/SAF/Skeletons");
-		itfc->PrintLn("saf offset2id <hex_rva> - Address Library: convert RVA (offset in exe) to ID for this game version. Example: saf offset2id 1A2B3C4D");
+		if (!itfc) return;
+		SafePrintLn(itfc, "SAF (Starfield Animation Framework) Commands:");
+		SafePrintLn(itfc, "saf play <path> [actorID] - Odtwarza animację na NPC lub graczu.");
+		SafePrintLn(itfc, "  Cel: (1) Skieruj celownik na NPC, otwórz konsolę, wpisz: saf play tw");
+		SafePrintLn(itfc, "  (2) Albo kliknij NPC w konsoli (widać ref ID), potem: saf play tw <refID> (np. 0x12345 lub decimal)");
+		SafePrintLn(itfc, "saf stop [actorID] - Zatrzymuje animację SAF (domyślnie: NPC pod celownikiem lub gracz)");
+		SafePrintLn(itfc, "saf optimize <file> [compression_level] - Optimizes GLTF to SAF");
+		SafePrintLn(itfc, "saf dumpbones [actorID] - Dumps actor 3D bone hierarchy to Data/SAF/Skeletons");
+		SafePrintLn(itfc, "saf offset2id <hex_rva> - Address Library: convert RVA (offset in exe) to ID for this game version. Example: saf offset2id 1A2B3C4D");
 	}
 
 	RE::Actor* StrToActor(std::string_view a_str, bool a_verbose = true)
 	{
 		std::string s(a_str);
 		if (s.empty()) {
-			if (a_verbose) itfc->PrintLn("Error: No actor ID given");
+			if (a_verbose) SafePrintLn(itfc, "Error: No actor ID given");
 			return nullptr;
 		}
 		RE::Actor* actor = GetActorByRefID(s);
-		if (!actor && a_verbose) itfc->PrintLn("Error: Actor not found (use ref ID in decimal or 0xhex, or aim at NPC and use no ID)");
+		if (!actor && a_verbose) SafePrintLn(itfc, "Error: Actor not found (use ref ID in decimal or 0xhex, or aim at NPC and use no ID)");
 		return actor;
 	}
 
@@ -430,18 +504,18 @@ namespace Commands::SAFCommand
 	{
 		auto assetData = Serialization::GLTFImport::LoadGLTF(a_in);
 		if (!assetData) {
-			itfc->PrintLn("Error: Failed to load GLTF asset");
+			SafePrintLn(itfc, "Error: Failed to load GLTF asset");
 			return;
 		}
 
 		if (assetData->asset.animations.empty()) {
-			itfc->PrintLn("Error: Asset has no animations");
+			SafePrintLn(itfc, "Error: Asset has no animations");
 			return;
 		}
 
 		const ozz::animation::Skeleton* skel = a_skeleton ? a_skeleton->GetRawSkeleton() : nullptr;
 		if (!skel) {
-			itfc->PrintLn("Error: No skeleton for optimization");
+			SafePrintLn(itfc, "Error: No skeleton for optimization");
 			return;
 		}
 		auto rawAnim = Serialization::GLTFImport::CreateRawAnimation(
@@ -450,19 +524,19 @@ namespace Commands::SAFCommand
 			skel,
 			a_skeleton ? &a_skeleton->jointNames : nullptr);
 		if (!rawAnim || !rawAnim->data) {
-			itfc->PrintLn("Error: Failed to create raw animation");
+			SafePrintLn(itfc, "Error: Failed to create raw animation");
 			return;
 		}
 
 		auto bytes = Serialization::GLTFExport::CreateOptimizedAsset(rawAnim.get(), skel, a_compression);
 		if (bytes.empty()) {
-			itfc->PrintLn("Error: Failed to create optimized asset");
+			SafePrintLn(itfc, "Error: Failed to create optimized asset");
 			return;
 		}
 		std::ofstream ofs(a_out, std::ios::binary);
 		if (ofs)
 			ofs.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-		itfc->PrintLn("Optimization successful.");
+		SafePrintLn(itfc, "Optimization successful.");
 	}
 
 	// Dodaje zlecenie play do kolejki – BEZ wywołań RE (bezpieczne z wątku konsoli)
@@ -511,15 +585,29 @@ namespace Commands::SAFCommand
 				}
 			}
 			if (actorId.empty()) {
-				// 1) MCF GetSelectedReference (zaznaczony NPC w konsoli).
-				// 2) Fallback: crosshairRef – celownik na NPC (działa gdy konsola nie zwraca ref).
+				// 1) Native console ref (prid / klik na obiekt w konsoli).
+				// 2) MCF GetSelectedReference.
+				// 3) Fallback: crosshairRef – celownik na NPC.
 				auto* mgrMain = Animation::GraphManager::GetSingleton();
 				RE::Actor* actorToPlay = nullptr;
-				if (itfc && mgrMain) {
-					RE::NiPointer<RE::TESObjectREFR> sel = itfc->GetSelectedReference();
-					if (sel && sel->IsActor()) {
-						actorToPlay = static_cast<RE::Actor*>(sel.get());
-						SAF_LOG_INFO("[CMD] ProcessPlayCommand: using MCF selected ref");
+				if (mgrMain) {
+					RE::TESObjectREFR* consoleRef = GetConsoleReference();
+					if (consoleRef && consoleRef->IsActor()) {
+						actorToPlay = static_cast<RE::Actor*>(consoleRef);
+						SAF_LOG_INFO("[CMD] ProcessPlayCommand: using console selected ref");
+					}
+				}
+				if (!actorToPlay && itfc && mgrMain) {
+					try {
+						RE::NiPointer<RE::TESObjectREFR> sel = itfc->GetSelectedReference();
+						if (sel && sel->IsActor()) {
+							actorToPlay = static_cast<RE::Actor*>(sel.get());
+							SAF_LOG_INFO("[CMD] ProcessPlayCommand: using MCF selected ref");
+						}
+					} catch (const std::exception& e) {
+						SAF_LOG_WARN("[SAF] GetSelectedReference exception: {}", e.what());
+					} catch (...) {
+						SAF_LOG_WARN("[SAF] GetSelectedReference unknown exception");
 					}
 				}
 				if (!actorToPlay && mgrMain) {
@@ -532,36 +620,23 @@ namespace Commands::SAFCommand
 						}
 					}
 				}
+				// Zawsze kolejka na główny wątek – nigdy LoadAndStartAnimation z wątku hooka (freeze + data race).
 				if (actorToPlay && mgrMain) {
-					mgrMain->InstallHooks();
-					auto resolvedKey = ResolveOverridePath(path);
-					auto resolvedPath = ResolveAnimationPathWithFallback(resolvedKey);
-					std::string pathStr = resolvedPath.string();
-					try {
-						mgrMain->LoadAndStartAnimation(actorToPlay, pathStr);
-						mgrMain->RequestGraphUpdate();
-						SetLastAnimInfo(pathStr, actorToPlay);
-						if (itfc) itfc->PrintLn("SAF: Animacja na NPC pod celownikiem. Zamknij konsolę (~).");
-					} catch (const std::exception& e) {
-						SAF_LOG_ERROR("[CMD] ProcessPlayCommand: sync play exception {}", e.what());
-						if (itfc) itfc->PrintLn("SAF: Błąd odtwarzania.");
-					}
-					QueueCloseConsole();
-					SAF_LOG_INFO("[CMD] ProcessPlayCommand: DONE (sync selected/crosshair)");
-					return;
+					char refIdBuf[16];
+					std::snprintf(refIdBuf, sizeof(refIdBuf), "%08X", actorToPlay->GetFormID());
+					actorId = refIdBuf;
+					SAF_LOG_INFO("[CMD] ProcessPlayCommand: queuing play for ref ID {} (console/crosshair)", actorId);
+				} else {
+					actorId = "player";
+					SAF_LOG_INFO("[CMD] ProcessPlayCommand: no selection and no crosshair NPC, using actorId='player'");
+					SafePrintLn(itfc, "SAF: Odtwarzanie na graczu (brak zaznaczenia w konsoli). Użyj: saf play <anim> <refID> lub skieruj celownik na NPC.");
 				}
-				actorId = "player";
-				SAF_LOG_INFO("[CMD] ProcessPlayCommand: no selection and no crosshair NPC, using actorId='player'");
-				if (itfc) itfc->PrintLn("SAF: Odtwarzanie na graczu (brak zaznaczenia w konsoli). Użyj: saf play <anim> <refID> lub skieruj celownik na NPC.");
 			}
 		}
 		SAF_LOG_INFO("[CMD] ProcessPlayCommand: final path='{}', actorId='{}'", path, actorId);
 
-		// Ensure hooks are installed when using RVA override.
-		if (auto* mgr = Animation::GraphManager::GetSingleton()) {
-			mgr->InstallHooks();
-		}
-
+		// InstallHooks jest wywoływane raz przy starcie w PluginCore::OnPostPostLoad / OnPostLoadGame.
+		// Nie wolno wołać go z wątku hooka konsoli – tutaj tylko kolejkujemy zlecenie.
 		SAF_LOG_INFO("[CMD] ProcessPlayCommand: pushing play command to main-thread queue");
 		const bool byRefId = !actorId.empty() && actorId != "player" && actorId != "0" && actorId != "14";
 		const std::string actorIdCopy = actorId;
@@ -569,9 +644,9 @@ namespace Commands::SAFCommand
 		SAF_LOG_INFO("[CMD] ProcessPlayCommand: command queued successfully");
 		if (itfc) {
 			if (!byRefId)
-				itfc->PrintLn("SAF: Odtwarzanie na celownik/gracz. Zamknij konsole (~). Dla NPC: saf play <anim> <refID>.");
+				SafePrintLn(itfc, "SAF: Odtwarzanie na celownik/gracz. Zamknij konsole (~). Dla NPC: saf play <anim> <refID>.");
 			else
-				itfc->PrintLn(("SAF: Odtwarzanie na ref ID " + actorIdCopy + ". Zamknij konsolę (~).").c_str());
+				SafePrintLn(itfc, "SAF: Odtwarzanie na ref ID " + actorIdCopy + ". Zamknij konsolę (~).");
 		}
 
 		QueueProcessPending();
@@ -625,17 +700,30 @@ namespace Commands::SAFCommand
 		Animation::GraphManager::GetSingleton()->StartSequence(actor, std::move(phases));
 	}
 
+	// Maks. liczba argumentów – zabezpieczenie przed błędnym/zmodyfikowanym parserem (INI, .bat)
+	static constexpr uint64_t kMaxArgsSize = 128;
+
 	void Run(const MCF::simple_array<MCF::simple_string_view>& a_args, const char* a_fullString, MCF::ConsoleInterface* a_intfc)
 	{
-		InitDefaultAliases();
-		LoadOverridesFromIni();
+		try {
+			InitDefaultAliases();
+			LoadOverridesFromIni();
+		} catch (const std::exception& e) {
+			SAF_LOG_WARN("[SAF] Run init exception: {}", e.what());
+		} catch (...) {
+			SAF_LOG_WARN("[SAF] Run init unknown exception");
+		}
+
+		// Walidacja wejścia – unikaj crashy przy zmodyfikowanym MCF/INI lub innych modach
+		if (!a_args.data || a_args.size() > kMaxArgsSize) {
+			SAF_LOG_WARN("[SAF] Run: invalid args (data={}, size={}), ignoring", static_cast<void*>(a_args.data), a_args.size());
+			return;
+		}
+
 		SAF_LOG_INFO("[MCF] Run: ENTRY - args.size()={}, fullString='{}'", a_args.size(), a_fullString ? a_fullString : "(null)");
-		
-		// Minimalne użycie itfc - tylko gdy konieczne (help, errors)
 		itfc = a_intfc;
 		args = a_args;
 		fullStr = a_fullString;
-		
 		SAF_LOG_INFO("[MCF] Run: variables set, itfc={}", static_cast<void*>(itfc));
 
 		if (args.size() < 1) {
@@ -646,11 +734,12 @@ namespace Commands::SAFCommand
 			return;
 		}
 
-		std::string_view cmd = ToSV(args[0]);
-		SAF_LOG_INFO("[MCF] Run: command='{}'", cmd);
+		try {
+			std::string_view cmd = ToSV(args[0]);
+			SAF_LOG_INFO("[MCF] Run: command='{}'", cmd);
 
-		// Komendy synchroniczne (help) - mogą używać itfc
-		if (cmd == "help") {
+			// Komendy synchroniczne (help) - mogą używać itfc
+			if (cmd == "help") {
 			SAF_LOG_INFO("[MCF] Run: handling 'help' command");
 			if (itfc) ShowHelp();
 			QueueCloseConsole();
@@ -675,7 +764,7 @@ namespace Commands::SAFCommand
 			}
 			if (actor) {
 				Animation::GraphManager::GetSingleton()->StopAnimation(actor);
-				if (itfc) itfc->PrintLn("Animation stopped.");
+				SafePrintLn(itfc, "Animation stopped.");
 			}
 			QueueCloseConsole();
 			return;
@@ -733,7 +822,7 @@ namespace Commands::SAFCommand
 		// Address Library: offset (RVA) → ID dla aktualnej wersji gry (np. 1.15.222)
 		if (cmd == "offset2id") {
 			if (args.size() < 2) {
-				if (itfc) itfc->PrintLn("Usage: saf offset2id <hex_rva>   (RVA = offset in Starfield.exe, from IDA)");
+				SafePrintLn(itfc, "Usage: saf offset2id <hex_rva>   (RVA = offset in Starfield.exe, from IDA)");
 				QueueCloseConsole();
 				return;
 			}
@@ -744,7 +833,7 @@ namespace Commands::SAFCommand
 			try {
 				offset = std::stoull(hexStr, nullptr, 16);
 			} catch (...) {
-				if (itfc) itfc->PrintLn("Error: invalid hex value");
+				SafePrintLn(itfc, "Error: invalid hex value");
 				QueueCloseConsole();
 				return;
 			}
@@ -756,11 +845,11 @@ namespace Commands::SAFCommand
 				}
 				std::uint64_t id = o2id->get_id(offset);
 				std::string msg = std::format("Offset 0x{:X} -> Address Library ID: {}", offset, id);
-				if (itfc) itfc->PrintLn(MCF::simple_string_view(msg.c_str(), msg.size()));
+				SafePrintLn(itfc, msg);
 				SAF_LOG_INFO("offset2id: RVA 0x{:X} -> ID {}", offset, id);
 			} catch (const std::exception& e) {
 				std::string errMsg = std::string("Error: ") + e.what() + " (offset not in Address Library?)";
-				if (itfc) itfc->PrintLn(MCF::simple_string_view(errMsg.c_str(), errMsg.size()));
+				SafePrintLn(itfc, errMsg);
 				SAF_LOG_ERROR("offset2id failed: {}", e.what());
 			}
 			QueueCloseConsole();
@@ -781,6 +870,11 @@ namespace Commands::SAFCommand
 			SAF_LOG_INFO("[MCF] Run: EXIT (unknown command)");
 		}
 		QueueCloseConsole();
+		} catch (const std::exception& e) {
+			SAF_LOG_WARN("[SAF] Run command exception: {}", e.what());
+		} catch (...) {
+			SAF_LOG_WARN("[SAF] Run command unknown exception");
+		}
 	}
 
 	void ProcessPendingCommands()
@@ -825,16 +919,17 @@ namespace Commands::SAFCommand
 			}
 			std::lock_guard<std::mutex> lock(g_pendingMutex);
 			queueSizeBefore = g_pendingPlay.size();
-			if (callNum <= 10 || callNum % 60 == 0 || queueSizeBefore > 0) {
-				SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: lock acquired, queue size BEFORE swap: {} (call #{})", queueSizeBefore, callNum);
+			// Ograniczenie na jedną klatkę – zapobiega zawieszce przy .bat / wielu komendach
+			size_t toTake = (std::min)(g_pendingPlay.size(), kMaxPendingCommandsPerFrame);
+			for (size_t i = 0; i < toTake && !g_pendingPlay.empty(); ++i) {
+				batch.push(std::move(g_pendingPlay.front()));
+				g_pendingPlay.pop();
 			}
-			batch.swap(g_pendingPlay);
-			size_t batchSizeAfter = batch.size();
-			if (batchSizeAfter == 0) {
-				g_hasPendingCommands.store(false, std::memory_order_release);  // Kolejka pusta, wyczyść flagę
+			if (g_pendingPlay.empty()) {
+				g_hasPendingCommands.store(false, std::memory_order_release);
 			}
-			if (callNum <= 10 || callNum % 60 == 0 || batchSizeAfter > 0) {
-				SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: queue SWAPPED. Global queue now empty. Local batch size: {} (call #{})", batchSizeAfter, callNum);
+			if (callNum <= 10 || callNum % 60 == 0 || batch.size() > 0) {
+				SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: took {} from queue ({} left), batch size: {} (call #{})", toTake, g_pendingPlay.size(), batch.size(), callNum);
 			}
 		}
 		if (callNum <= 10 || callNum % 60 == 0) {
@@ -873,8 +968,8 @@ namespace Commands::SAFCommand
 			if (!actor) {
 				SAF_LOG_WARN("[PROCESS] ProcessPendingCommands: actor not found, skipping command");
 				const bool byRefId = (cmd.actorId != "player" && cmd.actorId != "0" && cmd.actorId != "14");
-				if (byRefId && itfc) {
-					itfc->PrintLn(("SAF: Nie znaleziono aktora o ref ID " + cmd.actorId + ". Upewnij się, że ID jest poprawne (np. prid <id> w konsoli).").c_str());
+				if (byRefId) {
+					SafePrintLn(itfc, "SAF: Nie znaleziono aktora o ref ID " + cmd.actorId + ". Upewnij się, że ID jest poprawne (np. prid <id> w konsoli).");
 				}
 				continue;
 			}

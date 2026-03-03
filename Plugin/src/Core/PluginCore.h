@@ -50,6 +50,13 @@ namespace SAF::Core
         { 
             spdlog::info("OnPostDataLoad - game data loaded");
             Settings::LoadBaseSkeletons();
+            // SFSE nie ma kPostLoadGame – gdy hooki były odroczone, instaluj je teraz (dane gry załadowane)
+            if (!hooksInstalled_) {
+                spdlog::info("Installing animation hooks (PostDataLoad, deferred)...");
+                Animation::GraphManager::GetSingleton()->InstallHooks();
+                hooksInstalled_ = true;
+                spdlog::info("Animation hooks installed (PostDataLoad)");
+            }
         }
         
         void OnNewGame()      

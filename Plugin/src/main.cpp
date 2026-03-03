@@ -4,6 +4,7 @@
 #include "API/API_External.h"
 #include "Core/PluginCore.h"
 #include "Animation/GraphManager.h"
+#include "Papyrus/SAFScript.h"
 #include <Windows.h>
 
 // SFSE używa GetProcAddress("SFSEPlugin_Version") – symbol MUSI mieć linkage C (bez manglowania)
@@ -27,6 +28,24 @@ extern "C" DLLEXPORT constinit const SFSE::PluginVersionData SFSEPlugin_Version 
 namespace
 {
     bool g_coreInitialized = false;
+    bool g_papyrusBound = false;
+
+    void TryBindPapyrus()
+    {
+        if (g_papyrusBound)
+            return;
+        auto* vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+        if (!vm) {
+            SAF_LOG_WARN("SAF: Papyrus VM not ready yet, will retry on PostDataLoad");
+            return;
+        }
+        if (Papyrus::SAFScript::Bind(vm)) {
+            g_papyrusBound = true;
+            SAF_LOG_INFO("SAF: Papyrus SAFScript functions bound successfully");
+        } else {
+            SAF_LOG_ERROR("SAF: Failed to bind Papyrus SAFScript functions");
+        }
+    }
 
     void LogStartupError(const char* a_message) noexcept
     {
@@ -88,6 +107,7 @@ namespace
                 break;
             case SFSE::MessagingInterface::kPostDataLoad:
                 SAF_LOG_INFO("PostDataLoad");
+                TryBindPapyrus();  // VM gotowy po załadowaniu danych – fallback jeśli API init był za wcześnie
                 if (g_coreInitialized) {
                     SAF::Core::PluginCore::GetSingleton()->OnPostDataLoad();
                 }
@@ -121,6 +141,11 @@ extern "C" DLLEXPORT bool SFSEAPI SFSEPlugin_Load(const SFSE::LoadInterface* a_s
         InitializeLogging();
         SAF_LOG_INFO("SAF Plugin loading...");
         SFSE::Init(a_sfse);
+
+			// Rejestracja funkcji Papyrus – API init może być za wcześnie (VM null),
+			// fallback w PostDataLoad gdy VM jest już gotowy
+			SFSE::RegisterForAPIInitEvent([]() { TryBindPapyrus(); });
+
         if (auto* messaging = SFSE::GetMessagingInterface()) {
             messaging->RegisterListener(MessageHandler);
         }
