@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -37,5 +38,9 @@ namespace Animation
     {
         ozz::unique_ptr<ozz::animation::offline::RawAnimation> data = nullptr;
         std::unique_ptr<RawOzzFaceAnimation> faceData = nullptr;
+        // For each joint track (same indexing as jointNames / RawAnimation::tracks):
+        // 1 if the GLTF clip had at least one TRS channel for that joint; 0 otherwise.
+        // Used to avoid applying default/identity transforms to sensitive joints (e.g. face bones) when the clip doesn't animate them.
+        std::vector<std::uint8_t> jointHasChannel;
     };
 }

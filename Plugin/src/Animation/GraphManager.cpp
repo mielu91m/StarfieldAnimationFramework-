@@ -2,6 +2,7 @@
 #include <array>
 #include "Animation/GraphManager.h"
 #include "Commands/SAFCommand.h"
+#include "Papyrus/EventManager.h"
 #include "Tasks/Input.h"
 #include "Serialization/GLTFImport.h"
 #include "Settings/Settings.h"
@@ -20,6 +21,7 @@
 #include "RE/I/IMenu.h"
 #include "RE/B/BSTEvent.h"
 #include "RE/P/PlayerCamera.h"
+#include "RE/P/PlayerCharacter.h"
 #include "RE/U/UIMessageQueue.h"
 #include "RE/U/UI.h"
 #include <ozz/animation/offline/animation_builder.h>
@@ -96,6 +98,9 @@ static std::atomic<std::uint32_t> g_animGraphManagerCallRva{ 0 };
 static std::atomic<bool> g_inputHookEnabled{ false };
 static std::atomic<bool> g_cameraHookEnabled{ false };
 static std::atomic<bool> g_menuHookEnabled{ true };
+	/// Skip our logic for the first N hook calls after install, or while player not in world (avoids crash when loading save). 0 = disabled.
+	static std::atomic<uint32_t> g_skipFirstNHookCalls{ 300 };
+	static std::atomic<uint32_t> g_skipFirstNHookCallsConfig{ 300 };
 	// Apply Y-up (GLTF) to Z-up (Creation Engine). 1=apply ±90° X to delta; 0=no conversion.
 	static std::atomic<bool> g_applyYUpToZUpConversion{ true };
 	// 1 = use +90° X instead of -90° X for Y->Z. Try if pose is still distorted.
@@ -112,9 +117,9 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 	// Zakładamy, że animacja jest już w tym samym układzie co szkielet gry (Z-up). Domyślnie bez YUpToZUpConversion.
 	static std::atomic<bool> g_useNAFApplyMode{ false };
 	// 1 = pozwól animacji sterować kośćmi twarzy (Eye/Jaw/faceBone_*). 0 = zostaw pod grą (FaceGen/morphy).
-	static std::atomic<bool> g_animateFaceJoints{ false };
+	static std::atomic<bool> g_animateFaceJoints{ true };  // default on: face bones animated with blend so they don't disappear
 	// Siła miksu twarzy: 0.0 = tylko gra, 1.0 = tylko animacja, wartości pośrednie = blend.
-	static std::atomic<float> g_faceAnimStrength{ 0.0f };
+	static std::atomic<float> g_faceAnimStrength{ 0.5f };  // 0.5 = 50% anim / 50% game for face rotation
 	// 0 = off, 1..4 = prosta poprawka osi dla kręgosłupa i nóg (Spine/Legs) po wyliczeniu macierzy:
 	// 1: R*Rx(+90°), 2: R*Rx(-90°), 3: R*Ry(+90°), 4: R*Ry(-90°).
 	static std::atomic<int> g_spineLegsSimpleAxisFix{ 0 };
@@ -277,7 +282,16 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 				const bool enabled = ParseBool(value, false);
 				g_inputHookEnabled.store(enabled, std::memory_order_release);
 				SAF_LOG_INFO("InputHook enabled: {}", enabled ? "true" : "false");
-		} else if (key == "EnableCameraHook") {
+			} else if (key == "SkipFirstNHookCalls") {
+				try {
+					uint32_t n = static_cast<uint32_t>(std::stoul(std::string(Trim(value)), nullptr, 0));
+					g_skipFirstNHookCallsConfig.store(n, std::memory_order_release);
+					g_skipFirstNHookCalls.store(n, std::memory_order_release);
+					SAF_LOG_INFO("SkipFirstNHookCalls: {} (skip our logic until player in world / first N calls; 0=off)", n);
+				} catch (...) {
+					SAF_LOG_WARN("SkipFirstNHookCalls invalid in ini: {}", value);
+				}
+			} else if (key == "EnableCameraHook") {
 				const bool enabled = ParseBool(value, false);
 				g_cameraHookEnabled.store(enabled, std::memory_order_release);
 				SAF_LOG_INFO("CameraHook enabled: {}", enabled ? "true" : "false");
@@ -384,6 +398,24 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 		} else if (key == "SkeletonRootName") {
 			g_skeletonRootName = Trim(value);
 			SAF_LOG_INFO("SkeletonRootName: '{}' (empty=search from actor root; set to e.g. NPC to restrict bones to body subtree, fixes leg/arm mix-up)", g_skeletonRootName.empty() ? "" : g_skeletonRootName);
+		} else if (key == "SkipSkeletonPathsContaining") {
+			std::vector<std::string> substrings;
+			std::string v(Trim(value));
+			if (!v.empty()) {
+				for (size_t start = 0; start < v.size(); ) {
+					size_t comma = v.find(',', start);
+					std::string part = (comma == std::string::npos) ? v.substr(start) : v.substr(start, comma - start);
+					part = Trim(part);
+					if (!part.empty()) substrings.push_back(part);
+					start = (comma == std::string::npos) ? v.size() : comma + 1;
+				}
+			}
+			Settings::SetSkipSkeletonPathSubstrings(std::move(substrings));
+			SAF_LOG_INFO("SkipSkeletonPathsContaining: {} (SAF will skip actors whose race skeleton path contains any of these; use for SFF Body Replacer / SF Extended Skeleton)", value.empty() ? "(empty)" : value.data());
+		} else if (key == "AllowAnimationsOnExtendedSkeleton") {
+			const bool enabled = ParseBool(value, false);
+			Settings::SetAllowAnimationsOnExtendedSkeleton(enabled);
+			SAF_LOG_INFO("AllowAnimationsOnExtendedSkeleton: {} (1=animations on SFF/Extended; 0=skip when in skip list; set 1 in INI for universal)", enabled ? "true" : "false");
 		} else if (key == "TransposeOutputRotation") {
 			const bool enabled = ParseBool(value, false);
 			g_transposeOutputRotation.store(enabled, std::memory_order_release);
@@ -771,17 +803,35 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		std::shared_ptr<Animation::OzzSkeleton> skeleton;
 		std::unique_ptr<Animation::Generator> generator;
 		std::vector<RE::NiAVObject*> jointNodes;
+		// 1 if the current clip contains at least one TRS channel for this joint; 0 otherwise.
+		// Used to keep face bones stable when the animation doesn't animate them.
+		std::vector<std::uint8_t> jointHasChannel;
 		std::vector<Animation::Transform> localTransforms;
 		std::vector<Animation::Transform> restTransforms;     // OZZ bind-pose, or actor rest when UseActorRestPose
 		std::vector<Animation::Transform> actorRestTransforms; // captured from actor when building joint map (if UseActorRestPose)
 		std::vector<std::array<float,9>> gameBaseRotations;   // game's original bone matrices, captured once
-	bool jointMapBuilt = false;
-	bool loggedFirstUpdate = false;
-	bool jointMapBuildFailed = false;  // set when loadedData access causes AV, stop retrying
-	uint32_t animFrameCount = 0;       // per-animation frame counter, reset when generator changes
+		bool jointMapBuilt = false;
+		bool loggedFirstUpdate = false;
+		bool jointMapBuildFailed = false;
+		uint32_t animFrameCount = 0;
+		// NAF-style API state
+		std::string currentAnimationPath;
+		float playbackSpeed = 1.0f;
+		bool positionLocked = false;
+		float positionX = 0.0f, positionY = 0.0f, positionZ = 0.0f;
+		std::unordered_map<std::string, float> blendGraphVariables;
+	};
+
+	struct ActorSequenceState
+	{
+		std::vector<Sequencer::PhaseData> phases;
+		int currentPhaseIndex = 0;
+		bool loop = false;
 	};
 
 	static std::unordered_map<RE::TESFormID, ActorGraphState> g_actorGraphs;
+	static std::unordered_map<RE::TESFormID, ActorSequenceState> g_actorSequenceState;
+	static std::unordered_map<RE::TESFormID, RE::TESFormID> g_syncOwner;  // actor formId -> owner formId (owner points to self)
 	static std::mutex g_graphMutex;
 	// Set of actors we already logged access-violation for (SafeBuildJointMap); file scope to avoid C2712 with __try.
 	static std::unordered_set<RE::Actor*> g_loggedAvActorsBuildJointMap;
@@ -1823,6 +1873,11 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 				std::string npcName = "NPC " + withSpaces;
 				if (auto* n = searchRoot->GetObjectByName(RE::BSFixedString(npcName.c_str()))) { a_out[i] = n; ++found; continue; }
 			}
+			// Try 2c: "NPC " + original name (keep underscores) – SFF / extended skeleton often uses e.g. "NPC L_Clavicle"
+			if (!name.empty()) {
+				std::string npcOrig = "NPC " + name;
+				if (auto* n = searchRoot->GetObjectByName(RE::BSFixedString(npcOrig.c_str()))) { a_out[i] = n; ++found; continue; }
+			}
 			// Try 3: normalized (strip "NPC ", lowercase)
 			{
 				std::string norm = NormalizeBoneName(name);
@@ -1970,12 +2025,33 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		static std::atomic<uint32_t> hookCallCount{ 0 };
 		uint32_t callNum = ++hookCallCount;
 
+		// Skip our logic until player is in world (avoids crash when loading save - world/actor 3D not ready yet).
+		const uint32_t skipConfig = g_skipFirstNHookCallsConfig.load(std::memory_order_acquire);
+		auto* player = skipConfig > 0 ? RE::PlayerCharacter::GetSingleton() : nullptr;
+		bool playerInWorld = player && GetActor3DRootRaw(player) != nullptr;
+		if (skipConfig > 0 && !playerInWorld) {
+			g_skipFirstNHookCalls.store(skipConfig, std::memory_order_release);
+			int64_t result = g_originalGraphUpdate ? g_originalGraphUpdate(a_this, a_param2, a_param3) : 0;
+			return result;
+		}
+		uint32_t skipRemaining = g_skipFirstNHookCalls.load(std::memory_order_acquire);
+		if (skipRemaining > 0) {
+			g_skipFirstNHookCalls.store(skipRemaining - 1, std::memory_order_release);
+			int64_t result = g_originalGraphUpdate ? g_originalGraphUpdate(a_this, a_param2, a_param3) : 0;
+			return result;
+		}
+
 	if (auto remaining = g_debugHookLogs.load(std::memory_order_relaxed); remaining > 0) {
 		g_debugHookLogs.fetch_sub(1, std::memory_order_relaxed);
 		SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: debug tick callNum={}, thread={}", callNum, GetCurrentThreadId());
 	}
 	g_hookSeen.store(true, std::memory_order_release);
-		
+		{
+			static std::atomic<bool> s_safeExtendedSet{ false };
+			if (!s_safeExtendedSet.exchange(true)) {
+				Settings::SetSafeToUseExtendedSkeleton(true);
+			}
+		}
 		// Log pierwsze 10 wywołań, potem co 60 (co ~1 sekundę przy 60 FPS)
 		if (callNum <= 10 || callNum % 60 == 0) {
 			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: ENTRY (call #{})", callNum);
@@ -2845,7 +2921,7 @@ static bool InstallAnimGraphManagerCallHook()
 	// Implementacje metod GraphManager (przeniesione z .h - można rozbudować)
 	// ============================================================================
 
-	void GraphManager::LoadAndStartAnimation(RE::Actor* a_actor, std::string_view a_path)
+	void GraphManager::LoadAndStartAnimation(RE::Actor* a_actor, std::string_view a_path, bool a_looping)
 	{
 		try {
 			SAF_LOG_INFO("LoadAndStartAnimation: actor={}, path={}",
@@ -2938,8 +3014,23 @@ static bool InstallAnimGraphManagerCallHook()
 
 			SAF_LOG_INFO("LoadAndStartAnimation: creating ClipGenerator");
 			auto gen = std::make_unique<Animation::ClipGenerator>(skeleton, std::move(runtimeAnim));
+			if (auto* cg = gen.get()) cg->SetLooping(a_looping);
 			SAF_LOG_INFO("LoadAndStartAnimation: ClipGenerator created");
 			AttachGenerator(a_actor, std::move(gen), 0.0f);
+			// Store which joints are actually animated by this clip (so we can skip defaults on face bones etc.).
+			{
+				std::lock_guard<std::mutex> lock(g_graphMutex);
+				auto it = g_actorGraphs.find(a_actor->GetFormID());
+				if (it != g_actorGraphs.end()) {
+					it->second.jointHasChannel = rawAnim->jointHasChannel;
+				}
+			}
+			{
+				std::lock_guard<std::mutex> lock(g_graphMutex);
+				auto it = g_actorGraphs.find(a_actor->GetFormID());
+				if (it != g_actorGraphs.end())
+					it->second.currentAnimationPath = std::string(a_path);
+			}
 			SAF_LOG_INFO("LoadAndStartAnimation: generator attached");
 		} catch (const std::exception& e) {
 			SAF_LOG_ERROR("LoadAndStartAnimation: exception {}", e.what());
@@ -2975,6 +3066,8 @@ static bool InstallAnimGraphManagerCallHook()
 		}
 
 		g_actorGraphs.erase(it);
+		g_actorSequenceState.erase(id);
+		g_syncOwner.erase(id);
 		SAF_LOG_INFO("DetachGenerator: graph removed for actor {:X}", id);
 	}
 
@@ -2995,30 +3088,176 @@ static bool InstallAnimGraphManagerCallHook()
 
 	void GraphManager::SyncGraphs(const std::vector<RE::Actor*>& a_actors)
 	{
-		SAF_LOG_INFO("SyncGraphs: {} actors", a_actors.size());
+		if (a_actors.empty()) return;
+		RE::TESFormID ownerId = a_actors[0]->GetFormID();
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		for (RE::Actor* a : a_actors) {
+			if (a) g_syncOwner[a->GetFormID()] = ownerId;
+		}
+		SAF_LOG_INFO("SyncGraphs: {} actors, owner={:X}", a_actors.size(), ownerId);
 	}
 
 	void GraphManager::StopSyncing(RE::Actor* a_actor)
 	{
-		SAF_LOG_INFO("StopSyncing: actor={}", static_cast<void*>(a_actor));
+		if (!a_actor) return;
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		RE::TESFormID id = a_actor->GetFormID();
+		RE::TESFormID ownerId = g_syncOwner[id];
+		g_syncOwner.erase(id);
+		if (ownerId == id) {
+			for (auto it = g_syncOwner.begin(); it != g_syncOwner.end(); ) {
+				if (it->second == ownerId) it = g_syncOwner.erase(it);
+				else ++it;
+			}
+		}
+		SAF_LOG_INFO("StopSyncing: actor={:X}", id);
 	}
 
-	void GraphManager::StartSequence(RE::Actor* a_actor, std::vector<Sequencer::PhaseData>&& a_phases)
+	void GraphManager::StartSequence(RE::Actor* a_actor, std::vector<Sequencer::PhaseData>&& a_phases, bool a_loop)
 	{
-		SAF_LOG_INFO("StartSequence: actor={}, phases={}",
-			static_cast<void*>(a_actor), a_phases.size());
+		if (!a_actor || a_phases.empty()) return;
+		RE::TESFormID id = a_actor->GetFormID();
+		std::string firstFile;
+		bool firstLoop = true;
+		size_t numPhases = 0;
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			g_actorSequenceState[id] = ActorSequenceState{ std::move(a_phases), 0, a_loop };
+			numPhases = g_actorSequenceState[id].phases.size();
+			firstFile = g_actorSequenceState[id].phases[0].file;
+			firstLoop = (g_actorSequenceState[id].phases[0].loopCount != 0);
+		}
+		LoadAndStartAnimation(a_actor, firstFile, firstLoop);
+		Papyrus::EventManager::GetSingleton()->DispatchPhaseBegin(a_actor, 0, firstFile);
+		SAF_LOG_INFO("StartSequence: actor={:X}, phases={}", id, numPhases);
 	}
 
 	void GraphManager::AdvanceSequence(RE::Actor* a_actor, bool a_smooth)
 	{
-		SAF_LOG_INFO("AdvanceSequence: actor={}, smooth={}",
-			static_cast<void*>(a_actor), a_smooth);
+		if (!a_actor) return;
+		RE::TESFormID id = a_actor->GetFormID();
+		std::string nextFile;
+		bool nextLoop = true;
+		bool sequenceEnded = false;
+		int nextPhaseIndex = -1;
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			auto it = g_actorSequenceState.find(id);
+			if (it == g_actorSequenceState.end()) return;
+			ActorSequenceState& seq = it->second;
+			seq.currentPhaseIndex++;
+			if (seq.currentPhaseIndex >= static_cast<int>(seq.phases.size())) {
+				if (seq.loop) seq.currentPhaseIndex = 0;
+				else {
+					g_actorSequenceState.erase(it);
+					sequenceEnded = true;
+				}
+			}
+			if (!sequenceEnded) {
+				nextPhaseIndex = seq.currentPhaseIndex;
+				nextFile = seq.phases[seq.currentPhaseIndex].file;
+				nextLoop = (seq.phases[seq.currentPhaseIndex].loopCount != 0);
+			}
+		}
+		if (sequenceEnded) {
+			std::string animName = GetCurrentAnimation(a_actor);
+			Papyrus::EventManager::GetSingleton()->DispatchSequenceEnd(a_actor, animName);
+			StopAnimation(a_actor);
+			return;
+		}
+		LoadAndStartAnimation(a_actor, nextFile, nextLoop);
+		Papyrus::EventManager::GetSingleton()->DispatchPhaseBegin(a_actor, nextPhaseIndex, nextFile);
 	}
 
 	void GraphManager::SetGraphControlsPosition(RE::Actor* a_actor, bool a_lock)
 	{
-		SAF_LOG_INFO("SetGraphControlsPosition: actor={}, lock={}",
-			static_cast<void*>(a_actor), a_lock);
+		if (!a_actor) return;
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		auto it = g_actorGraphs.find(a_actor->GetFormID());
+		if (it != g_actorGraphs.end()) it->second.positionLocked = a_lock;
+	}
+
+	std::string GraphManager::GetCurrentAnimation(RE::Actor* a_actor) const
+	{
+		if (!a_actor) return "";
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		auto it = g_actorGraphs.find(a_actor->GetFormID());
+		return it != g_actorGraphs.end() ? it->second.currentAnimationPath : "";
+	}
+
+	void GraphManager::SetAnimationSpeed(RE::Actor* a_actor, float a_speed)
+	{
+		if (!a_actor) return;
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		auto it = g_actorGraphs.find(a_actor->GetFormID());
+		if (it == g_actorGraphs.end()) return;
+		it->second.playbackSpeed = a_speed;
+		if (auto* cg = dynamic_cast<Animation::ClipGenerator*>(it->second.generator.get()))
+			cg->SetSpeed(a_speed);
+	}
+
+	float GraphManager::GetAnimationSpeed(RE::Actor* a_actor) const
+	{
+		if (!a_actor) return 0.0f;
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		auto it = g_actorGraphs.find(a_actor->GetFormID());
+		return it != g_actorGraphs.end() ? it->second.playbackSpeed : 0.0f;
+	}
+
+	void GraphManager::SetActorPosition(RE::Actor* a_actor, float a_x, float a_y, float a_z)
+	{
+		if (!a_actor) return;
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		auto it = g_actorGraphs.find(a_actor->GetFormID());
+		if (it != g_actorGraphs.end()) {
+			it->second.positionX = a_x; it->second.positionY = a_y; it->second.positionZ = a_z;
+		}
+	}
+
+	int GraphManager::GetSequencePhase(RE::Actor* a_actor) const
+	{
+		if (!a_actor) return -1;
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		auto it = g_actorSequenceState.find(a_actor->GetFormID());
+		return it != g_actorSequenceState.end() ? it->second.currentPhaseIndex : -1;
+	}
+
+	bool GraphManager::SetSequencePhase(RE::Actor* a_actor, int a_phase)
+	{
+		if (!a_actor) return false;
+		std::string phaseFile;
+		bool phaseLoop = true;
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			auto it = g_actorSequenceState.find(a_actor->GetFormID());
+			if (it == g_actorSequenceState.end() || a_phase < 0 || a_phase >= static_cast<int>(it->second.phases.size())) return false;
+			it->second.currentPhaseIndex = a_phase;
+			phaseFile = it->second.phases[a_phase].file;
+			phaseLoop = (it->second.phases[a_phase].loopCount != 0);
+		}
+		LoadAndStartAnimation(a_actor, phaseFile, phaseLoop);
+		Papyrus::EventManager::GetSingleton()->DispatchPhaseBegin(a_actor, a_phase, phaseFile);
+		return true;
+	}
+
+	bool GraphManager::SetBlendGraphVariable(RE::Actor* a_actor, const std::string& a_name, float a_value)
+	{
+		if (!a_actor) return false;
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		auto it = g_actorGraphs.find(a_actor->GetFormID());
+		if (it == g_actorGraphs.end()) return false;
+		it->second.blendGraphVariables[a_name] = a_value;
+		return true;
+	}
+
+	float GraphManager::GetBlendGraphVariable(RE::Actor* a_actor, const std::string& a_name) const
+	{
+		if (!a_actor) return 0.0f;
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		auto it = g_actorGraphs.find(a_actor->GetFormID());
+		if (it == g_actorGraphs.end()) return 0.0f;
+		auto v = it->second.blendGraphVariables.find(a_name);
+		return v != it->second.blendGraphVariables.end() ? v->second : 0.0f;
 	}
 
 	void GraphManager::AttachGenerator(RE::Actor* a_actor, std::unique_ptr<Generator> a_generator, float a_transitionTime)
@@ -3038,26 +3277,47 @@ static bool InstallAnimGraphManagerCallHook()
 			SAF_LOG_WARN("AttachGenerator: no skeleton for actor");
 			return;
 		}
-	SAF_LOG_INFO("AttachGenerator: skeleton ok (joints={})", skeleton->jointNames.size());
+		SAF_LOG_INFO("AttachGenerator: skeleton ok (joints={})", skeleton->jointNames.size());
+
+		RE::TESFormID id = a_actor->GetFormID();
+		float preservedSpeed = 1.0f;
+		bool preservedLock = false;
+		float px = 0.0f, py = 0.0f, pz = 0.0f;
+		std::unordered_map<std::string, float> preservedVars;
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			auto it = g_actorGraphs.find(id);
+			if (it != g_actorGraphs.end()) {
+				preservedSpeed = it->second.playbackSpeed;
+				preservedLock = it->second.positionLocked;
+				px = it->second.positionX; py = it->second.positionY; pz = it->second.positionZ;
+				preservedVars = it->second.blendGraphVariables;
+			}
+		}
 
 		ActorGraphState state;
 		state.skeleton = skeleton;
 		state.generator = std::move(a_generator);
-	state.jointNodes.clear();
-	state.jointMapBuilt = false;
-	state.loggedFirstUpdate = false;
-	state.animFrameCount = 0;
+		state.jointNodes.clear();
+		state.jointMapBuilt = false;
+		state.loggedFirstUpdate = false;
+		state.animFrameCount = 0;
+		state.playbackSpeed = preservedSpeed;
+		state.positionLocked = preservedLock;
+		state.positionX = px; state.positionY = py; state.positionZ = pz;
+		state.blendGraphVariables = std::move(preservedVars);
 
-	// Never touch loadedData here - it can CTD on some Starfield/CommonLibSF builds.
-	// Joint map is always built in UpdateGraphs when the per-frame hook runs.
-	SAF_LOG_INFO("AttachGenerator: joint map will be built in UpdateGraphs for actor={}", static_cast<void*>(a_actor));
-	g_debugHookLogs.store(120, std::memory_order_relaxed);
+		if (auto* cg = dynamic_cast<Animation::ClipGenerator*>(state.generator.get()))
+			cg->SetSpeed(state.playbackSpeed);
 
-	{
-		std::lock_guard<std::mutex> lock(g_graphMutex);
-		SAF_LOG_INFO("AttachGenerator: storing graph state");
-		g_actorGraphs[a_actor->GetFormID()] = std::move(state);
-	}
+		SAF_LOG_INFO("AttachGenerator: joint map will be built in UpdateGraphs for actor={}", static_cast<void*>(a_actor));
+		g_debugHookLogs.store(120, std::memory_order_relaxed);
+
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			SAF_LOG_INFO("AttachGenerator: storing graph state");
+			g_actorGraphs[id] = std::move(state);
+		}
 		SAF_LOG_INFO("AttachGenerator: graphs now={}", g_actorGraphs.size());
 	g_rebindOnNextHook.store(true, std::memory_order_release);
 	g_forceUpdate.store(true, std::memory_order_release);
@@ -3122,20 +3382,22 @@ bool GraphManager::ShouldDeferHookInstall() const
 			}
 		}
 
-		std::lock_guard<std::mutex> lock(g_graphMutex);
-		if (g_actorGraphs.empty()) {
-			static std::atomic<uint32_t> emptyGraphCount{ 0 };
-			uint32_t c = ++emptyGraphCount;
-			if (c <= 5 || c % 120 == 0) {
-				SAF_LOG_INFO("[UPDATE] UpdateGraphs: no active graphs");
+		std::vector<RE::Actor*> sequenceAdvanceActors;
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			if (g_actorGraphs.empty()) {
+				static std::atomic<uint32_t> emptyGraphCount{ 0 };
+				uint32_t c = ++emptyGraphCount;
+				if (c <= 5 || c % 120 == 0) {
+					SAF_LOG_INFO("[UPDATE] UpdateGraphs: no active graphs");
+				}
+				return;
 			}
-			return;
-		}
 
-		static std::atomic<uint32_t> updateCount{ 0 };
-		const uint32_t ucount = ++updateCount;
+			static std::atomic<uint32_t> updateCount{ 0 };
+			const uint32_t ucount = ++updateCount;
 
-		for (auto& kv : g_actorGraphs) {
+			for (auto& kv : g_actorGraphs) {
 			const auto id = kv.first;
 			auto& state = kv.second;
 
@@ -3283,13 +3545,26 @@ bool GraphManager::ShouldDeferHookInstall() const
 			continue;
 		}
 
-			if (auto* clipGen = dynamic_cast<Animation::ClipGenerator*>(state.generator.get())) {
+			Animation::ClipGenerator* clipGen = dynamic_cast<Animation::ClipGenerator*>(state.generator.get());
+			if (clipGen) {
 				clipGen->SetDeltaTime(a_deltaSeconds);
+				clipGen->SetSpeed(state.playbackSpeed);
 			}
 
 			auto soa = state.generator->Generate(nullptr);
 			UnpackSoaTransforms(soa, state.localTransforms, state.skeleton->jointNames.size());
 			++state.animFrameCount;
+
+			if (clipGen && clipGen->IsFinished()) {
+				auto itSeq = g_actorSequenceState.find(id);
+				if (itSeq != g_actorSequenceState.end()) {
+					if (!actor) {
+						actor = RE::TESForm::LookupByID<RE::Actor>(id);
+						if (!actor && id == 0x14) actor = RE::PlayerCharacter::GetSingleton();
+					}
+					if (actor) sequenceAdvanceActors.push_back(actor);
+				}
+			}
 
 			if (ucount <= 5 || ucount % 120 == 0) {
 				SAF_LOG_INFO("[UPDATE] UpdateGraphs: actor={}, joints={}, dt={}",
@@ -3337,14 +3612,16 @@ bool GraphManager::ShouldDeferHookInstall() const
 				}
 
 				const char* jointName = (i < state.skeleton->jointNames.size()) ? state.skeleton->jointNames[i].c_str() : nullptr;
-				// W trybie NAF nie piszemy do kości dłoni (palce, cup, Wrist) – gra nimi steruje (IK).
-				// Twarz (Eye/Jaw/faceBone_*) pomijamy tylko gdy AnimateFaceJoints=0 – gdy =1, pozwalamy animacji nadpisywać te kości.
-				if (g_useNAFApplyMode.load(std::memory_order_acquire) && jointName) {
-					if (IsHandJoint(jointName)) {
+				// Kości twarzy – pomijamy tylko gdy AnimateFaceJoints=0 (gra nimi steruje). Gdy =1, animujemy je z blendem żeby nie znikały.
+				if (jointName && IsFaceJoint(jointName)) {
+					if (!g_animateFaceJoints.load(std::memory_order_acquire)) {
 						++skippedControlled;
 						continue;
 					}
-					if (!g_animateFaceJoints.load(std::memory_order_acquire) && IsFaceJoint(jointName)) {
+				}
+				// W trybie NAF nie piszemy do kości dłoni (palce, cup, Wrist) – gra nimi steruje (IK).
+				if (g_useNAFApplyMode.load(std::memory_order_acquire) && jointName) {
+					if (IsHandJoint(jointName)) {
 						++skippedControlled;
 						continue;
 					}
@@ -3362,35 +3639,39 @@ bool GraphManager::ShouldDeferHookInstall() const
 
 				const float* base = (i < state.gameBaseRotations.size()) ? state.gameBaseRotations[i].data() : kIdentBase;
 
-				// Blend twarzy: miksuj pozę gry z animacją tylko dla kości twarzy, gdy AnimateFaceJoints=1 i FaceAnimationStrength>0.
-				if (g_useNAFApplyMode.load(std::memory_order_acquire) &&
-					jointName && IsFaceJoint(jointName) &&
-					g_animateFaceJoints.load(std::memory_order_acquire)) {
-					const float w = g_faceAnimStrength.load(std::memory_order_acquire);
-					if (w > 0.0f) {
-						Animation::Transform gamePose;
-						if (ReadBoneFullTransform(state.jointNodes[i], g_niTransformOffset.load(std::memory_order_acquire), gamePose)) {
-							const float iw = 1.0f - w;
-							// nlerp (normalized lerp) quaternions: q = normalize( (1-w)*qGame + w*qAnim )
-							float qx = iw * gamePose.rotation.x + w * anim.rotation.x;
-							float qy = iw * gamePose.rotation.y + w * anim.rotation.y;
-							float qz = iw * gamePose.rotation.z + w * anim.rotation.z;
-							float qw = iw * gamePose.rotation.w + w * anim.rotation.w;
-							const float qlen2 = qx*qx + qy*qy + qz*qz + qw*qw;
-							if (qlen2 > 1e-8f) {
-								const float invLen = 1.0f / std::sqrt(qlen2);
-								qx *= invLen; qy *= invLen; qz *= invLen; qw *= invLen;
-								anim.rotation.x = qx;
-								anim.rotation.y = qy;
-								anim.rotation.z = qz;
-								anim.rotation.w = qw;
-							}
-							// Lerp translation: pos = (1-w)*game + w*anim
-							anim.translation.x = iw * gamePose.translation.x + w * anim.translation.x;
-							anim.translation.y = iw * gamePose.translation.y + w * anim.translation.y;
-							anim.translation.z = iw * gamePose.translation.z + w * anim.translation.z;
-						}
+				// Kości twarzy (AnimateFaceJoints=1):
+				// - jeśli klip ich nie animuje (brak kanałów), nie pisz nic (zostaw grze) – inaczej domyślne tracki potrafią "wyciąć" dolną twarz.
+				// - jeśli animuje: miksuj z pozą gry, żeby były animowane i nie znikały.
+				// - jeśli nie da się odczytać pozy gry: nie pisz (zostaw grze).
+				if (jointName && IsFaceJoint(jointName) && g_animateFaceJoints.load(std::memory_order_acquire)) {
+					if (i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
+						++skippedControlled;
+						continue;
 					}
+					Animation::Transform gamePose;
+					if (!ReadBoneFullTransform(state.jointNodes[i], g_niTransformOffset.load(std::memory_order_acquire), gamePose)) {
+						// Nie nadpisuj kości twarzy bez blendu – inaczej znika dolna część (usta, broda). Gra zostaje przy swojej pozie.
+						++skippedControlled;
+						continue;
+					}
+					float w = g_faceAnimStrength.load(std::memory_order_acquire);
+					if (w <= 0.0f || w > 1.0f) w = 0.5f;
+					if (w > 0.85f) w = 0.85f;  // cap: zawsze min. ~15% gry, żeby twarz nie znikała przy FaceAnimationStrength=1
+					const float iw = 1.0f - w;
+					float qx = iw * gamePose.rotation.x + w * anim.rotation.x;
+					float qy = iw * gamePose.rotation.y + w * anim.rotation.y;
+					float qz = iw * gamePose.rotation.z + w * anim.rotation.z;
+					float qw = iw * gamePose.rotation.w + w * anim.rotation.w;
+					const float qlen2 = qx*qx + qy*qy + qz*qz + qw*qw;
+					if (qlen2 > 1e-8f) {
+						const float invLen = 1.0f / std::sqrt(qlen2);
+						qx *= invLen; qy *= invLen; qz *= invLen; qw *= invLen;
+						anim.rotation.x = qx; anim.rotation.y = qy; anim.rotation.z = qz; anim.rotation.w = qw;
+					}
+					const float tw = 0.2f;  // 20% anim translation, 80% game – dolna część twarzy się nie rozjeżdża
+					anim.translation.x = (1.0f - tw) * gamePose.translation.x + tw * anim.translation.x;
+					anim.translation.y = (1.0f - tw) * gamePose.translation.y + tw * anim.translation.y;
+					anim.translation.z = (1.0f - tw) * gamePose.translation.z + tw * anim.translation.z;
 				}
 
 				// ── FRAMEDUMP: first 6 frames + frames 30,60,90 for key bones ──────────────
@@ -3423,9 +3704,21 @@ bool GraphManager::ShouldDeferHookInstall() const
 			}
 
 			if (actor) {
+				if (state.positionLocked) {
+					RE::NiPoint3 pos(state.positionX, state.positionY, state.positionZ);
+					actor->SetPosition(pos, false);
+				} else {
+					auto itSync = g_syncOwner.find(id);
+					if (itSync != g_syncOwner.end() && itSync->second != id) {
+						RE::Actor* owner = RE::TESForm::LookupByID<RE::Actor>(itSync->second);
+						if (owner) actor->SetPosition(owner->GetPosition(), false);
+					}
+				}
 				SafeUpdateWorldData(actor, actorRoot, &modifiedBones);
 			}
+			}
 		}
+		for (RE::Actor* a : sequenceAdvanceActors) AdvanceSequence(a, false);
 	}
 
 	bool GraphManager::HasActiveGraphs() const

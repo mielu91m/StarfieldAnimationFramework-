@@ -49,7 +49,7 @@ namespace SAF::Core
         void OnPostDataLoad() 
         { 
             spdlog::info("OnPostDataLoad - game data loaded");
-            Settings::LoadBaseSkeletons();
+            // Nie wywołuj LoadBaseSkeletons() tutaj – ładowanie przy pierwszym GetSkeleton w grze, żeby korpus SFF/body replacery zdążyły się wyświetlić.
             // SFSE nie ma kPostLoadGame – gdy hooki były odroczone, instaluj je teraz (dane gry załadowane)
             if (!hooksInstalled_) {
                 spdlog::info("Installing animation hooks (PostDataLoad, deferred)...");

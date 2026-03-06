@@ -18,8 +18,9 @@ namespace Papyrus
 	public:
 		struct RegisteredScript
 		{
-			VMHandle handle;  // Używamy naszego aliasu
-			std::string scriptName;
+			EventType type;
+			VMHandle handle;
+			std::string typeName;
 			std::string funcName;
 		};
 
@@ -29,44 +30,15 @@ namespace Papyrus
 			return &singleton;
 		}
 
-		// Rejestracja skryptu dla eventu
-		void RegisterScript(EventType a_type, VMHandle a_handle, std::string a_funcName)
-		{
-			std::lock_guard lock(_mutex);
-			_registrations.push_back({a_handle, "", a_funcName});
-			SAF_LOG_INFO("Registered script for event type {}", static_cast<int>(a_type));
-		}
-		
-		// Wyrejestrowanie skryptu
-		void UnregisterScript(EventType a_type, VMHandle a_handle)
-		{
-			std::lock_guard lock(_mutex);
-			_registrations.erase(
-				std::remove_if(_registrations.begin(), _registrations.end(),
-					[a_handle](const RegisteredScript& r) { return r.handle == a_handle; }),
-				_registrations.end()
-			);
-			SAF_LOG_INFO("Unregistered script for event type {}", static_cast<int>(a_type));
-		}
-		
-		// Uproszczona wersja bez IFunctionArguments (który nie istnieje w Starfield)
-		void DispatchEvent(std::string_view a_eventName)
-		{
-			std::lock_guard lock(_mutex);
-			SAF_LOG_DEBUG("Dispatching event: {}", a_eventName);
-			
-			// TODO: Po otrzymaniu IVirtualMachine.h z Starfield:
-			// - Pobrać VM
-			// - Wywołać funkcję na zarejestrowanych skryptach
-			// - Przekazać argumenty (sprawdzić jak w Starfield API)
-		}
-		
-		void Reset()
-		{
-			std::lock_guard lock(_mutex);
-			_registrations.clear();
-			SAF_LOG_INFO("EventManager::Reset - cleared {} registrations", _registrations.size());
-		}
+		void RegisterScript(EventType a_type, VMHandle a_handle, std::string a_typeName, std::string a_funcName);
+		void UnregisterScript(EventType a_type, VMHandle a_handle);
+
+		/// PhaseBegin: (ObjectReference akTarget, Int iPhase, String sName)
+		void DispatchPhaseBegin(RE::Actor* a_actor, int a_phaseIndex, const std::string& a_phaseName);
+		/// SequenceEnd: (ObjectReference akTarget, String sName)
+		void DispatchSequenceEnd(RE::Actor* a_actor, const std::string& a_sequenceName);
+
+		void Reset();
 
 	private:
 		EventManager() = default;

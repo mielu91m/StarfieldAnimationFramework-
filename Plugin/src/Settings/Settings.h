@@ -9,6 +9,7 @@
 #include <memory>
 #include "ozz/base/maths/transform.h"
 #include "RE/Starfield.h" // Rozwiązuje błędy RE::Actor
+#include <optional>
 
 namespace Settings
 {
@@ -40,6 +41,15 @@ namespace Settings
 	std::shared_ptr<Animation::OzzSkeleton> GetSkeleton(RE::Actor* a_actor);
 	void LoadSkeletonForRace(RE::TESRace* a_race);  // ładowanie na żądanie z rasy aktora
 	bool IsDefaultSkeleton(const std::shared_ptr<Animation::OzzSkeleton>& a_skele);
+
+	/// Returns race skeleton model path (from TESRace::unk5E8) if any.
+	std::optional<std::string> GetSkeletonModelPathFromRace(RE::TESRace* a_race);
+	/// When set, GetSkeleton returns nullptr for actors whose race skeleton path contains any of these substrings (case-insensitive). Use for SFF Body Replacer / SF Extended Skeleton.
+	void SetSkipSkeletonPathSubstrings(std::vector<std::string> a_substrings);
+	/// When true, actors with path containing "extended" or "sff" are not skipped (SAF animations play on SFF/extended bodies even if they are in the skip list).
+	void SetAllowAnimationsOnExtendedSkeleton(bool a_allow);
+	/// Set by plugin when game is safe (player in world, post-load). When false, GetSkeleton returns nullptr for extended/SFF paths to avoid load crash.
+	void SetSafeToUseExtendedSkeleton(bool a_safe);
 
 	// Face Morphs
 	void SetFaceMorphs(const std::vector<std::string>& a_morphs);

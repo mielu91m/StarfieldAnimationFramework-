@@ -111,7 +111,7 @@ namespace Settings
 	}
 
 	// Pobiera ścieżkę NIF bezpośrednio z TESRace (gdy mamy wskaźnik na rasę z aktora).
-	static std::optional<std::string> GetSkeletonModelPathFromRace(RE::TESRace* a_race)
+	std::optional<std::string> GetSkeletonModelPathFromRace(RE::TESRace* a_race)
 	{
 		if (!a_race) return std::nullopt;
 		for (std::size_t i = 0; i < 4; ++i) {
@@ -153,7 +153,11 @@ namespace Settings
 			return false;
 		}
 		for (auto& bone : a_desc.bones) {
-			auto gameNode = m->GetObjectByName(bone.name.c_str());
+			RE::NiAVObject* gameNode = m->GetObjectByName(RE::BSFixedString(bone.name.c_str()));
+			if (!gameNode && !bone.name.empty()) {
+				std::string npcName = "NPC " + bone.name;
+				gameNode = m->GetObjectByName(RE::BSFixedString(npcName.c_str()));
+			}
 			if (!gameNode) continue;
 			if (gameNode->parent) bone.parent = gameNode->parent->name.c_str();
 			RE::NiQuaternion rotQuat(gameNode->local.rotate);
@@ -180,7 +184,11 @@ namespace Settings
 			return false;
 		}
 		for (auto& bone : a_desc.bones) {
-			auto gameNode = m->GetObjectByName(bone.name.c_str());
+			RE::NiAVObject* gameNode = m->GetObjectByName(RE::BSFixedString(bone.name.c_str()));
+			if (!gameNode && !bone.name.empty()) {
+				std::string npcName = "NPC " + bone.name;
+				gameNode = m->GetObjectByName(RE::BSFixedString(npcName.c_str()));
+			}
 			if (!gameNode)
 				continue;
 
@@ -258,18 +266,11 @@ namespace Settings
 						}
 					}
 
-					// Kluczowy krok jak w NAF: nadpisz parent/restPose danymi z modelu NIF rasy.
+					// Nie wywołuj ModelDB::GetEntry tutaj – w PostDataLoad preładowanie NIF rasy (np. vanilla) może spowodować, że gra użyje tego modelu dla gracza i korpus SFF w ogóle się nie pojawi. Rest pose z NIF uzupełniamy dopiero w LoadSkeletonForRace (na żądanie, gdy gracz jest już w świecie).
 					const auto raceName = p.stem().string();
-					// Opcjonalnie w JSON: "raceEditorID": "HumanRace" – do wyszukania rasy w grze (domyślnie = nazwa pliku).
-					std::string_view raceLookup = raceName;
-					auto raceIdField = doc["raceEditorID"];
-					if (raceIdField.error() == simdjson::error_code::SUCCESS) {
-						raceLookup = raceIdField.get_string().value();
-					}
-					FillInSkeletonNIFData(skele, raceLookup);
 
 					skeletons[raceName] = skele.BuildRuntime(raceName);
-					SAF_LOG_INFO("Loaded skeleton: {} (race lookup: {})", raceName, raceLookup);
+					SAF_LOG_INFO("Loaded skeleton: {} (rest from NIF on first use via LoadSkeletonForRace)", raceName);
 
 				} catch (const std::exception& e) {
 					SAF_LOG_ERROR("Failed to parse skeleton {}: {}", p.string(), e.what());

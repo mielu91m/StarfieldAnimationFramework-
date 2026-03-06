@@ -47,6 +47,13 @@ namespace Tasks
 
 	static void PerformInputProcessingHookImpl(const RE::PlayerCamera* a_camera, const RE::InputEvent* a_queueHead)
 	{
+		// Run game input processing FIRST so activation (E), docking, menus etc. respond immediately.
+		// Previously we ran ProcessPendingCommands + UpdateGraphs before the game, causing noticeable
+		// input lag and broken docking when UpdateGraphs was slow.
+		if (g_originalInputProcessing) {
+			g_originalInputProcessing(a_camera, a_queueHead);
+		}
+
 		static std::atomic<uint32_t> callCount{ 0 };
 		static auto lastTick = std::chrono::steady_clock::now();
 		uint32_t count = ++callCount;
@@ -57,7 +64,6 @@ namespace Tasks
 		const bool hasPending = Commands::SAFCommand::HasPendingCommands();
 		const bool requested = Commands::SAFCommand::HasProcessRequest();
 		if (hasPending || requested) {
-			SAF_LOG_INFO("[INPUT] PerformInputProcessingHook: pending flags (req={}, pending={})", requested, hasPending);
 			if (requested) {
 				Commands::SAFCommand::ConsumeProcessRequest();
 			}
@@ -65,7 +71,6 @@ namespace Tasks
 			if (Commands::SAFCommand::ConsumeCloseConsole()) {
 				Commands::SAFCommand::CloseConsoleMainThread();
 			}
-			SAF_LOG_INFO("[INPUT] PerformInputProcessingHook: ProcessPendingCommands done");
 		}
 
 		if (auto* mgr = Animation::GraphManager::GetSingleton()) {
@@ -92,10 +97,6 @@ namespace Tasks
 			if (auto iter = m->callbacks.find(btnEvent->idCode); iter != m->callbacks.end()) {
 				iter->second(code, isDown);
 			}
-		}
-
-		if (g_originalInputProcessing) {
-			g_originalInputProcessing(a_camera, a_queueHead);
 		}
 	}
 

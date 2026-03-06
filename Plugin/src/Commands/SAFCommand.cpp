@@ -697,7 +697,7 @@ namespace Commands::SAFCommand
 			p.loopCount = Util::String::StrToInt(std::string(ToSV(args[i + 1]))).value_or(0);
 			p.transitionTime = Util::String::StrToFloat(std::string(ToSV(args[i + 2]))).value_or(1.0f);
 		}
-		Animation::GraphManager::GetSingleton()->StartSequence(actor, std::move(phases));
+		Animation::GraphManager::GetSingleton()->StartSequence(actor, std::move(phases), false);
 	}
 
 	// Maks. liczba argumentów – zabezpieczenie przed błędnym/zmodyfikowanym parserem (INI, .bat)
@@ -756,16 +756,50 @@ namespace Commands::SAFCommand
 		}
 		if (cmd == "stop") {
 			RE::Actor* actor = nullptr;
+
 			if (args.size() > 1) {
+				// Explicit actor argument: form ID / alias.
 				actor = StrToActor(ToSV(args[1]), itfc != nullptr);
 			} else {
-				// Bez arg: gracz (GetSelectedReference z wątku konsoli wywalało; nie używamy).
-				actor = RE::PlayerCharacter::GetSingleton();
+				// No explicit arg: mirror ProcessPlayCommand target resolution:
+				// 1) Native console selected ref (prid / click in console).
+				// 2) MCF ConsoleInterface::GetSelectedReference().
+				// 3) Crosshair actor or player.
+				auto* mgrMain = Animation::GraphManager::GetSingleton();
+				if (mgrMain) {
+					if (auto* consoleRef = GetConsoleReference(); consoleRef && consoleRef->IsActor()) {
+						actor = static_cast<RE::Actor*>(consoleRef);
+						SAF_LOG_INFO("[CMD] stop: using console selected ref");
+					}
+				}
+				if (!actor && itfc && mgrMain) {
+					try {
+						RE::NiPointer<RE::TESObjectREFR> sel = itfc->GetSelectedReference();
+						if (sel && sel->IsActor()) {
+							actor = static_cast<RE::Actor*>(sel.get());
+							SAF_LOG_INFO("[CMD] stop: using MCF selected ref");
+						}
+					} catch (const std::exception& e) {
+						SAF_LOG_WARN("[SAF] stop GetSelectedReference exception: {}", e.what());
+					} catch (...) {
+						SAF_LOG_WARN("[SAF] stop GetSelectedReference unknown exception");
+					}
+				}
+				if (!actor) {
+					actor = GetPlayerOrCrosshairActor();
+					if (actor) {
+						SAF_LOG_INFO("[CMD] stop: using player/crosshair actor");
+					}
+				}
 			}
+
 			if (actor) {
-				Animation::GraphManager::GetSingleton()->StopAnimation(actor);
-				SafePrintLn(itfc, "Animation stopped.");
+				if (auto* mgr = Animation::GraphManager::GetSingleton()) {
+					mgr->StopAnimation(actor);
+					SafePrintLn(itfc, "Animation stopped.");
+				}
 			}
+
 			QueueCloseConsole();
 			return;
 		}

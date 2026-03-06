@@ -450,6 +450,9 @@ std::unique_ptr<Animation::RawOzzAnimation> GLTFImport::CreateRawAnimation(
 		auto& animResult = rawAnimResult->data;
 		animResult->duration = 0.0f;
 	animResult->tracks.resize(jointCount);
+		// Track which joints are actually animated by the clip (any TRS channel present).
+		// This lets callers skip applying defaults to joints that aren't animated (especially face bones).
+		rawAnimResult->jointHasChannel.assign(jointCount, static_cast<std::uint8_t>(0));
 
 		size_t channelIndex = 0;
 		for (auto& c : anim->channels) {
@@ -548,6 +551,7 @@ std::unique_ptr<Animation::RawOzzAnimation> GLTFImport::CreateRawAnimation(
 				if (!ReadAccessorFloats(asset, dataAcc, 4, values, "data", channelIndex)) {
 					continue;
 				}
+				rawAnimResult->jointHasChannel[idx] = static_cast<std::uint8_t>(1);
 				const std::size_t frames = values.size() / 4;
 				for (std::size_t f = 0; f < frames; ++f) {
 					auto& k = animResult->tracks[idx].rotations.emplace_back();
@@ -559,6 +563,7 @@ std::unique_ptr<Animation::RawOzzAnimation> GLTFImport::CreateRawAnimation(
 				if (!ReadAccessorFloats(asset, dataAcc, 3, values, "data", channelIndex)) {
 					continue;
 				}
+				rawAnimResult->jointHasChannel[idx] = static_cast<std::uint8_t>(1);
 				const std::size_t frames = values.size() / 3;
 				for (std::size_t f = 0; f < frames; ++f) {
 					auto& k = animResult->tracks[idx].translations.emplace_back();
@@ -570,6 +575,7 @@ std::unique_ptr<Animation::RawOzzAnimation> GLTFImport::CreateRawAnimation(
 				if (!ReadAccessorFloats(asset, dataAcc, 3, values, "data", channelIndex)) {
 					continue;
 				}
+				rawAnimResult->jointHasChannel[idx] = static_cast<std::uint8_t>(1);
 				const std::size_t frames = values.size() / 3;
 				for (std::size_t f = 0; f < frames; ++f) {
 					auto& k = animResult->tracks[idx].scales.emplace_back();

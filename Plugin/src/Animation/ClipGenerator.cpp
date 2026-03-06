@@ -29,6 +29,17 @@ namespace Animation
 		_looping = a_loop;
 	}
 
+	float ClipGenerator::GetDuration() const
+	{
+		return _animation ? _animation->duration() : 0.0f;
+	}
+
+	bool ClipGenerator::IsFinished() const
+	{
+		if (!_animation || _looping) return false;
+		return _time >= _animation->duration();
+	}
+
 	std::span<ozz::math::SoaTransform> ClipGenerator::Generate(IAnimEventHandler* a_eventHandler)
 	{
 		if (!_animation) {

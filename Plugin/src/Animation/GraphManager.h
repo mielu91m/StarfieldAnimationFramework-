@@ -21,12 +21,20 @@ namespace Animation
 		void InstallHooks();
 
 		// Metody sterujące wywoływane przez konsolę
-		void LoadAndStartAnimation(RE::Actor* a_actor, std::string_view a_path);
+		void LoadAndStartAnimation(RE::Actor* a_actor, std::string_view a_path, bool a_looping = true);
+		std::string GetCurrentAnimation(RE::Actor* a_actor) const;
+		void SetAnimationSpeed(RE::Actor* a_actor, float a_speed);
+		float GetAnimationSpeed(RE::Actor* a_actor) const;
+		void SetActorPosition(RE::Actor* a_actor, float a_x, float a_y, float a_z);
+		int GetSequencePhase(RE::Actor* a_actor) const;
+		bool SetSequencePhase(RE::Actor* a_actor, int a_phase);
+		bool SetBlendGraphVariable(RE::Actor* a_actor, const std::string& a_name, float a_value);
+		float GetBlendGraphVariable(RE::Actor* a_actor, const std::string& a_name) const;
+		void StartSequence(RE::Actor* a_actor, std::vector<Sequencer::PhaseData>&& a_phases, bool a_loop);
 		void DetachGenerator(RE::Actor* a_actor, float a_duration);
 		void StopAnimation(RE::Actor* a_actor);
 		void SyncGraphs(const std::vector<RE::Actor*>& a_actors);
 		void StopSyncing(RE::Actor* a_actor);
-		void StartSequence(RE::Actor* a_actor, std::vector<Sequencer::PhaseData>&& a_phases);
 		void AdvanceSequence(RE::Actor* a_actor, bool a_smooth);
 		void SetGraphControlsPosition(RE::Actor* a_actor, bool a_lock);
 		

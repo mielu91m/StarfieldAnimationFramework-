@@ -15,6 +15,11 @@ namespace Animation
 		void SetDeltaTime(float a_dt);
 		void SetSpeed(float a_speed);
 		void SetLooping(bool a_loop);
+		float GetSpeed() const { return _speed; }
+		float GetDuration() const;
+		float GetCurrentTime() const { return _time; }
+		/// True when not looping and playback has reached the end
+		bool IsFinished() const;
 
 		std::span<ozz::math::SoaTransform> Generate(IAnimEventHandler* a_eventHandler) override;
 
