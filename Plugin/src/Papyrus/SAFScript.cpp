@@ -39,6 +39,15 @@ namespace Papyrus::SAFScript
 				return gltf;
 			}
 
+			// Prosta nazwa – szukaj po stem w podfolderach (np. cow1 -> mb/cow1.glb)
+			const bool simpleName = (a_path.find('/') == std::string_view::npos && a_path.find('\\') == std::string_view::npos);
+			if (simpleName && !a_path.empty()) {
+				auto found = Util::String::FindAnimationByStem(a_path);
+				if (found && std::filesystem::exists(*found)) {
+					return *found;
+				}
+			}
+
 			return resolved;
 		}
 

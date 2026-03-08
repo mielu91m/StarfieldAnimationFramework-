@@ -109,6 +109,15 @@ namespace Commands::SAFCommand
 			return gltf;
 		}
 
+		// Prosta nazwa (bez / i \) – szukaj po stem w podfolderach (np. cow1 -> mb/cow1.glb)
+		const bool simpleName = (a_path.find('/') == std::string_view::npos && a_path.find('\\') == std::string_view::npos);
+		if (simpleName && !a_path.empty()) {
+			auto found = Util::String::FindAnimationByStem(a_path);
+			if (found && std::filesystem::exists(*found)) {
+				return *found;
+			}
+		}
+
 		return resolved;
 	}
 
@@ -449,13 +458,16 @@ namespace Commands::SAFCommand
 				if (itfc) SafePrintLn(itfc, "SAF: Animations folder not found: " + dir.string());
 				return;
 			}
-			for (const auto& e : std::filesystem::directory_iterator(dir)) {
+			for (const auto& e : std::filesystem::recursive_directory_iterator(dir, std::filesystem::directory_options::skip_permission_denied)) {
 				if (!e.is_regular_file()) continue;
 				std::string ext = e.path().extension().string();
 				if (ext.size() >= 2) {
 					for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-					if (ext == ".glb" || ext == ".gltf" || ext == ".saf")
-						names.insert(e.path().stem().string());
+					if (ext == ".glb" || ext == ".gltf" || ext == ".saf") {
+						auto rel = std::filesystem::relative(e.path(), dir);
+						rel.replace_extension("");
+						names.insert(rel.generic_string());
+					}
 				}
 			}
 		} catch (const std::exception& ex) {
@@ -463,7 +475,7 @@ namespace Commands::SAFCommand
 			return;
 		}
 		if (itfc) {
-			SafePrintLn(itfc, "SAF animations (Data/SAF/Animations):");
+			SafePrintLn(itfc, "SAF animations (Data/SAF/Animations and subfolders):");
 			if (names.empty())
 				SafePrintLn(itfc, "  (none)");
 			else

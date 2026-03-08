@@ -20,6 +20,8 @@ namespace Serialization
 			std::map<size_t, std::vector<std::string>> morphTargets;
 			std::map<size_t, std::string> originalNames;
 			std::shared_ptr<fastgltf::MappedGltfFile> mappedFile;
+			/// When loading gzip-compressed binary GLB, buffer data is held here (mappedFile is null).
+			std::shared_ptr<std::vector<std::byte>> optionalBuffer;
 		};
 
 		struct SkeletonData
@@ -35,5 +37,7 @@ namespace Serialization
 			const ozz::animation::Skeleton* skeleton,
 			const std::vector<std::string>* jointNames = nullptr);
 		static std::unique_ptr<AssetData> LoadGLTF(const std::filesystem::path& fileName);
+		/// Last error from LoadGLTF when it returned nullptr (file/parse error or exception).
+		static const std::string& GetLastGLTFLoadError();
 	};
 }

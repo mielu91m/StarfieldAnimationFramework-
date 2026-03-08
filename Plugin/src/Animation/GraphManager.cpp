@@ -818,6 +818,7 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		std::vector<Animation::Transform> actorRestTransforms; // captured from actor when building joint map (if UseActorRestPose)
 		std::vector<std::array<float,9>> gameBaseRotations;   // game's original bone matrices, captured once
 		bool jointMapBuilt = false;
+		RE::NiAVObject* cachedActor3DRoot = nullptr;  // when 3D is recreated (e.g. after closing console), we must rebuild
 		bool loggedFirstUpdate = false;
 		bool jointMapBuildFailed = false;
 		uint32_t animFrameCount = 0;
@@ -2977,8 +2978,9 @@ static bool InstallAnimGraphManagerCallHook()
 
 			auto asset = Serialization::GLTFImport::LoadGLTF(path);
 			if (!asset) {
-				s_lastLoadError = "Failed to load GLTF: " + path.string();
-				SAF_LOG_ERROR("LoadAndStartAnimation: failed to load GLTF '{}'", path.string());
+				const std::string& detail = Serialization::GLTFImport::GetLastGLTFLoadError();
+				s_lastLoadError = detail.empty() ? ("Failed to load GLTF: " + path.string()) : (path.string() + " - " + detail);
+				SAF_LOG_ERROR("LoadAndStartAnimation: failed to load GLTF '{}' - {}", path.string(), detail);
 				return false;
 			}
 			if (asset->asset.animations.empty()) {
@@ -3487,6 +3489,7 @@ bool GraphManager::ShouldDeferHookInstall() const
 							}
 						} else {
 							state.jointMapBuilt = true;
+							state.cachedActor3DRoot = GetActor3DRootRaw(actor);
 							SAF_LOG_INFO("[UPDATE] UpdateGraphs: joint map built (found {}/{})", found, state.jointNodes.size());
 
 							// ── Capture rest pose: use animation bind (t=0) when available, else skeleton rest ──
@@ -3624,6 +3627,14 @@ bool GraphManager::ShouldDeferHookInstall() const
 				}
 			}
 			RE::NiAVObject* actorRoot = actor ? GetActor3DRootRaw(actor) : nullptr;
+
+			// If the game recreated the actor's 3D (e.g. after closing console), our joint pointers are stale – rebuild map next frame
+			if (state.cachedActor3DRoot != nullptr && actorRoot != nullptr && actorRoot != state.cachedActor3DRoot) {
+				state.jointMapBuilt = false;
+				state.cachedActor3DRoot = nullptr;
+				SAF_LOG_INFO("[UPDATE] UpdateGraphs: actor {:X} 3D root changed (e.g. console/refresh), will rebuild joint map", id);
+				continue;
+			}
 
 			static const float kIdentBase[9] = {1,0,0, 0,1,0, 0,0,1};
 			static Animation::Transform kIdentRest;  // default ctor: rot=(0,0,0,1)

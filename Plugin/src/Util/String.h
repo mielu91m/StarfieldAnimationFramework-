@@ -28,15 +28,39 @@ namespace Util::String
         return GetDataPath() / "SAF" / "Animations";
     }
 
-    // Rozwiązuje ścieżkę animacji. Jeśli path zawiera '/' lub '\\' lub zaczyna od "Data" – używa jako pełnej.
-    // W przeciwnym razie: GetAnimationsPath() / path (np. "R1" -> Data/SAF/Animations/R1)
+    // Rozwiązuje ścieżkę animacji. Jeśli path zaczyna od "Data" – używa jako pełnej (względem CWD).
+    // W przeciwnym razie: GetAnimationsPath() / path, także dla podfolderów (np. "R1" -> Data/SAF/Animations/R1, "subfolder/anim" -> Data/SAF/Animations/subfolder/anim).
     inline std::filesystem::path ResolveAnimationPath(std::string_view a_path)
     {
         std::string p(a_path);
-        if (p.find('/') != std::string::npos || p.find('\\') != std::string::npos ||
-            StartsWith(a_path, "Data"))
+        if (StartsWith(a_path, "Data"))
             return std::filesystem::path(p);
-        return GetAnimationsPath() / p;
+        return GetAnimationsPath() / std::filesystem::path(p);
+    }
+
+    // Szuka pliku animacji (.glb/.gltf/.saf) po nazwie (stem) w Data/SAF/Animations i we wszystkich podfolderach.
+    // Zwraca ścieżkę do pierwszego znalezionego pliku, lub nullopt gdy brak. Porównanie stem bez rozróżniania wielkości liter.
+    inline std::optional<std::filesystem::path> FindAnimationByStem(std::string_view a_stem)
+    {
+        const auto dir = GetAnimationsPath();
+        if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir))
+            return std::nullopt;
+        std::string stemLower(a_stem);
+        std::transform(stemLower.begin(), stemLower.end(), stemLower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+        try {
+            for (const auto& e : std::filesystem::recursive_directory_iterator(dir, std::filesystem::directory_options::skip_permission_denied)) {
+                if (!e.is_regular_file()) continue;
+                std::string ext = e.path().extension().string();
+                if (ext.size() < 2) continue;
+                for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (ext != ".glb" && ext != ".gltf" && ext != ".saf") continue;
+                std::string fileStem = e.path().stem().string();
+                std::transform(fileStem.begin(), fileStem.end(), fileStem.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+                if (fileStem == stemLower)
+                    return e.path();
+            }
+        } catch (...) {}
+        return std::nullopt;
     }
 
     inline std::string ToLower(std::string_view a_str)

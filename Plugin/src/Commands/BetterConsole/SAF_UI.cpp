@@ -139,20 +139,32 @@ namespace
 
 	inline void DrawActorsTab()
 	{
-		Animation::GraphManager::GetSingleton()->GetAllGraphs(actorTab.list);
+		auto* mgr = Animation::GraphManager::GetSingleton();
+		if (!mgr) {
+			UI->Text("SAF GraphManager not ready.");
+			return;
+		}
+		mgr->GetAllGraphs(actorTab.list);
 
 		UI->VboxTop(1.0f, 0.0f);
 		UI->HBoxLeft(0.3f, 20.0f);
-		UI->SelectionList(&actorTab.selectedIdx, nullptr, static_cast<uint32_t>(actorTab.list.size()),
-			[](const void* userdata, uint32_t index, char* out_buffer, uint32_t out_buffer_size) -> const char* {
-				auto& ele = actorTab.list[index];
-				std::snprintf(out_buffer, out_buffer_size, "%s (%08X)", ele.first->GetDisplayFullName(), ele.first->formID);
-				return out_buffer;
-			});
+		if (actorTab.list.empty()) {
+			UI->Text("No actors with active graphs.");
+			UI->Text("Play an animation with: saf play <name>");
+		} else {
+			UI->SelectionList(&actorTab.selectedIdx, nullptr, static_cast<uint32_t>(actorTab.list.size()),
+				[](const void* userdata, uint32_t index, char* out_buffer, uint32_t out_buffer_size) -> const char* {
+					auto& ele = actorTab.list[index];
+					std::snprintf(out_buffer, out_buffer_size, "%s (%08X)", ele.first->GetDisplayFullName(), ele.first->formID);
+					return out_buffer;
+				});
+		}
 		UI->HBoxRight();
 
 		if (auto iter = actorTab.GetSelectedItem(); iter != actorTab.list.end()) {
 			DrawActorGraphInfo(*iter);
+		} else if (!actorTab.list.empty()) {
+			UI->Text("Select an actor in the list.");
 		}
 		UI->HBoxEnd();
 		UI->VBoxEnd();
@@ -178,12 +190,17 @@ namespace
 
 	inline void DrawAnimationsTab()
 	{
+		auto* fileMgr = Animation::FileManager::GetSingleton();
+		if (!fileMgr) {
+			UI->Text("SAF FileManager not ready.");
+			return;
+		}
 		if (animTab.listNeedsUpdate) {
 			std::optional<Animation::AnimID> selectedId = std::nullopt;
 			if (auto iter = animTab.GetSelectedItem(); iter != animTab.list.end()) {
 				selectedId = iter->first;
 			}
-			Animation::FileManager::GetSingleton()->GetAllLoadedAnimations(animTab.list);
+			fileMgr->GetAllLoadedAnimations(animTab.list);
 			if (selectedId.has_value()) {
 				for (auto iter = animTab.list.begin(); iter != animTab.list.end(); iter++) {
 					if (iter->first == selectedId.value()) {
@@ -197,16 +214,24 @@ namespace
 
 		UI->VboxTop(1.0f, 0.0f);
 		UI->HBoxLeft(0.5f, 20.0f);
-		UI->SelectionList(&animTab.selectedIdx, nullptr, static_cast<uint32_t>(animTab.list.size()),
-			[](const void* userdata, uint32_t index, char* out_buffer, uint32_t out_buffer_size) -> const char* {
-				auto& ele = animTab.list[index];
-				std::snprintf(out_buffer, out_buffer_size, "%s (%s)", ele.first.file.QPath().data(), ele.first.skeleton.c_str());
-				return out_buffer;
-			});
+		if (animTab.list.empty()) {
+			UI->Text("No animations loaded yet.");
+			UI->Text("Play one with: saf play <name>");
+			UI->Text("(e.g. saf play cow1)");
+		} else {
+			UI->SelectionList(&animTab.selectedIdx, nullptr, static_cast<uint32_t>(animTab.list.size()),
+				[](const void* userdata, uint32_t index, char* out_buffer, uint32_t out_buffer_size) -> const char* {
+					auto& ele = animTab.list[index];
+					std::snprintf(out_buffer, out_buffer_size, "%s (%s)", ele.first.file.QPath().data(), ele.first.skeleton.c_str());
+					return out_buffer;
+				});
+		}
 		UI->HBoxRight();
 
 		if (auto iter = animTab.GetSelectedItem(); iter != animTab.list.end()) {
 			DrawAnimInfo(*iter);
+		} else if (!animTab.list.empty()) {
+			UI->Text("Select an animation in the list.");
 		}
 		UI->HBoxEnd();
 		UI->VBoxEnd();
@@ -222,6 +247,10 @@ namespace
 
 	void OnUIDraw(void*)
 	{
+		if (!UI) return;
+		UI->Separator();
+		UI->Text("SAF Companion - Open console with tilde (`) and select this tab.");
+		UI->Separator();
 		UI->TabBar(tabNames.data(), tabNames.size(), &activeTab);
 		switch (activeTab) {
 		case 0:
@@ -237,11 +266,24 @@ namespace
 	}
 }
 
+static void OnHotkeyOpenCompanion(uintptr_t)
+{
+	// User assigned this hotkey (e.g. F2) in Better Console -> Mod Menu -> Hotkeys.
+	// Opening the console is done by the game/Better Console; we just register the action.
+	if (API && API->Console && API->Console->RunCommand) {
+		API->Console->RunCommand("");  // Empty command can focus the console in some setups
+	}
+}
+
 static int OnBetterConsoleLoad(const struct better_api_t* better_api)
 {
+	if (!better_api || !better_api->Callback || !better_api->SimpleDraw)
+		return -1;
 	API = better_api;
 	UI = API->SimpleDraw;
 	RegistrationHandle handle = API->Callback->RegisterMod("StarfieldAnimationFrameworkSF");
 	API->Callback->RegisterDrawCallback(handle, &OnUIDraw);
+	API->Callback->RegisterHotkeyCallback(handle, &OnHotkeyOpenCompanion);
+	API->Callback->RequestHotkey(handle, "Open SAF Companion", 0);
 	return 0;
 }
