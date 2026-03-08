@@ -27,6 +27,7 @@
 #include <sstream>
 #include <atomic>
 #include <unordered_map>
+#include <vector>
 
 namespace Commands::SAFCommand
 {
@@ -479,10 +480,9 @@ namespace Commands::SAFCommand
 	{
 		if (!itfc) return;
 		SafePrintLn(itfc, "SAF (Starfield Animation Framework) Commands:");
-		SafePrintLn(itfc, "saf play <path> [actorID] - Odtwarza animację na NPC lub graczu.");
-		SafePrintLn(itfc, "  Cel: (1) Skieruj celownik na NPC, otwórz konsolę, wpisz: saf play tw");
-		SafePrintLn(itfc, "  (2) Albo kliknij NPC w konsoli (widać ref ID), potem: saf play tw <refID> (np. 0x12345 lub decimal)");
-		SafePrintLn(itfc, "saf stop [actorID] - Zatrzymuje animację SAF (domyślnie: NPC pod celownikiem lub gracz)");
+		SafePrintLn(itfc, "saf play <path> [actorID ...] - Odtwarza animację. Jedna osoba: saf play tw lub saf play tw <refID>.");
+		SafePrintLn(itfc, "  Wiele osób (ta sama animacja): saf play tw player 0x123 0x456 (gracz + NPC + NPC).");
+		SafePrintLn(itfc, "saf stop [actorID ...] - Zatrzymuje animację SAF. Bez argumentu: celownik/gracz. Wiele: saf stop player 0x123.");
 		SafePrintLn(itfc, "saf optimize <file> [compression_level] - Optimizes GLTF to SAF");
 		SafePrintLn(itfc, "saf dumpbones [actorID] - Dumps actor 3D bone hierarchy to Data/SAF/Skeletons");
 		SafePrintLn(itfc, "saf offset2id <hex_rva> - Address Library: convert RVA (offset in exe) to ID for this game version. Example: saf offset2id 1A2B3C4D");
@@ -567,13 +567,17 @@ namespace Commands::SAFCommand
 		}
 
 		std::string path(ToSV(args[idxStart]));
-		std::string actorId;
+		std::vector<std::string> actorIds;
 
 		if (args.size() > idxStart + 1) {
-			actorId = std::string(ToSV(args[idxStart + 1]));
-			SAF_LOG_INFO("[CMD] ProcessPlayCommand: parsed path='{}', actorId='{}'", path, actorId);
+			// Jawna lista aktorów: args[idxStart+1] .. args[args.size()-1] – ta sama animacja na każdym (player + NPC, NPC + NPC, itd.)
+			for (size_t i = idxStart + 1; i < args.size(); ++i) {
+				actorIds.push_back(std::string(ToSV(args[i])));
+			}
+			SAF_LOG_INFO("[CMD] ProcessPlayCommand: multi-actor path='{}', {} actor IDs", path, actorIds.size());
 		} else {
-			// Fallback: konsola może przekazać "animacja refID" w jednym argumencie (jeden token).
+			// Jedna osoba: brak argumentu lub "path refID" w jednym tokenie.
+			std::string actorId;
 			size_t lastSpace = path.rfind(' ');
 			if (lastSpace != std::string::npos && lastSpace + 1 < path.size()) {
 				std::string maybeRefId(path.substr(lastSpace + 1));
@@ -620,7 +624,6 @@ namespace Commands::SAFCommand
 						}
 					}
 				}
-				// Zawsze kolejka na główny wątek – nigdy LoadAndStartAnimation z wątku hooka (freeze + data race).
 				if (actorToPlay && mgrMain) {
 					char refIdBuf[16];
 					std::snprintf(refIdBuf, sizeof(refIdBuf), "%08X", actorToPlay->GetFormID());
@@ -632,29 +635,32 @@ namespace Commands::SAFCommand
 					SafePrintLn(itfc, "SAF: Odtwarzanie na graczu (brak zaznaczenia w konsoli). Użyj: saf play <anim> <refID> lub skieruj celownik na NPC.");
 				}
 			}
+			actorIds.push_back(std::move(actorId));
 		}
-		SAF_LOG_INFO("[CMD] ProcessPlayCommand: final path='{}', actorId='{}'", path, actorId);
 
-		// InstallHooks jest wywoływane raz przy starcie w PluginCore::OnPostPostLoad / OnPostLoadGame.
-		// Nie wolno wołać go z wątku hooka konsoli – tutaj tylko kolejkujemy zlecenie.
-		SAF_LOG_INFO("[CMD] ProcessPlayCommand: pushing play command to main-thread queue");
-		const bool byRefId = !actorId.empty() && actorId != "player" && actorId != "0" && actorId != "14";
-		const std::string actorIdCopy = actorId;
-		PushPendingPlay(std::move(path), std::move(actorId));
-		SAF_LOG_INFO("[CMD] ProcessPlayCommand: command queued successfully");
+		// Kolejkuj jedno odtwarzanie na aktora (ta sama ścieżka) – ProcessPendingCommands wykona je w jednej paczce.
+		for (std::string& aid : actorIds) {
+			PushPendingPlay(path, aid);
+		}
+		SAF_LOG_INFO("[CMD] ProcessPlayCommand: queued {} play(s) for path='{}'", actorIds.size(), path);
+
 		if (itfc) {
-			if (!byRefId)
-				SafePrintLn(itfc, "SAF: Odtwarzanie na celownik/gracz. Zamknij konsole (~). Dla NPC: saf play <anim> <refID>.");
-			else
-				SafePrintLn(itfc, "SAF: Odtwarzanie na ref ID " + actorIdCopy + ". Zamknij konsolę (~).");
+			if (actorIds.size() > 1) {
+				SafePrintLn(itfc, "SAF: Odtwarzanie na " + std::to_string(actorIds.size()) + " aktorów. Zamknij konsolę (~).");
+			} else if (actorIds.empty() == false) {
+				const std::string& aid = actorIds[0];
+				const bool byRefId = aid != "player" && aid != "0" && aid != "14";
+				if (!byRefId)
+					SafePrintLn(itfc, "SAF: Odtwarzanie na celownik/gracz. Zamknij konsole (~). Dla NPC: saf play <anim> <refID>.");
+				else
+					SafePrintLn(itfc, "SAF: Odtwarzanie na ref ID " + aid + ". Zamknij konsolę (~).");
+			}
 		}
 
 		QueueProcessPending();
 		QueueCloseConsole();
 
 		SAF_LOG_INFO("[CMD] ProcessPlayCommand: DONE");
-		// NIE wywołujemy itfc->PrintLn tutaj - może powodować deadlock.
-		// Komunikat wyświetlimy w ProcessPendingCommands po przetworzeniu.
 	}
 
 	void ProcessOptimizeCommand(uint64_t idxStart = 1)
@@ -755,16 +761,16 @@ namespace Commands::SAFCommand
 			return;
 		}
 		if (cmd == "stop") {
-			RE::Actor* actor = nullptr;
-
+			std::vector<RE::Actor*> toStop;
 			if (args.size() > 1) {
-				// Explicit actor argument: form ID / alias.
-				actor = StrToActor(ToSV(args[1]), itfc != nullptr);
+				// Jawna lista aktorów: saf stop player 0x123 0x456
+				for (size_t i = 1; i < args.size(); ++i) {
+					RE::Actor* a = StrToActor(ToSV(args[i]), itfc != nullptr);
+					if (a) toStop.push_back(a);
+				}
 			} else {
-				// No explicit arg: mirror ProcessPlayCommand target resolution:
-				// 1) Native console selected ref (prid / click in console).
-				// 2) MCF ConsoleInterface::GetSelectedReference().
-				// 3) Crosshair actor or player.
+				// Brak argumentu: jak wcześniej – console ref / MCF selected / crosshair lub gracz.
+				RE::Actor* actor = nullptr;
 				auto* mgrMain = Animation::GraphManager::GetSingleton();
 				if (mgrMain) {
 					if (auto* consoleRef = GetConsoleReference(); consoleRef && consoleRef->IsActor()) {
@@ -787,17 +793,16 @@ namespace Commands::SAFCommand
 				}
 				if (!actor) {
 					actor = GetPlayerOrCrosshairActor();
-					if (actor) {
-						SAF_LOG_INFO("[CMD] stop: using player/crosshair actor");
-					}
+					if (actor) SAF_LOG_INFO("[CMD] stop: using player/crosshair actor");
 				}
+				if (actor) toStop.push_back(actor);
 			}
 
-			if (actor) {
-				if (auto* mgr = Animation::GraphManager::GetSingleton()) {
-					mgr->StopAnimation(actor);
-					SafePrintLn(itfc, "Animation stopped.");
-				}
+			if (auto* mgr = Animation::GraphManager::GetSingleton()) {
+				for (RE::Actor* a : toStop)
+					mgr->StopAnimation(a);
+				if (!toStop.empty() && itfc)
+					SafePrintLn(itfc, toStop.size() > 1 ? "Animation stopped on " + std::to_string(toStop.size()) + " actors." : "Animation stopped.");
 			}
 
 			QueueCloseConsole();

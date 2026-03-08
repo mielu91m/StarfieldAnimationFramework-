@@ -3626,6 +3626,27 @@ bool GraphManager::ShouldDeferHookInstall() const
 						continue;
 					}
 				}
+				// Dłonie: jeśli klip nie animuje tej kości (brak kanału), nie nadpisuj – zostaw grze (naturalna poza/IK). Jak przy twarzy.
+				if (jointName && IsHandJoint(jointName)) {
+					if (i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
+						++skippedControlled;
+						continue;
+					}
+				}
+				// HumanRace.json ma zduplikowane nazwy (L_Wrist/R_Wrist dwa razy) – oba mapują na ten sam węzeł. Zapis tylko raz (pierwszy indeks wygrywa).
+				{
+					bool alreadyApplied = false;
+					for (size_t j = 0; j < i; ++j) {
+						if (state.jointNodes[j] == state.jointNodes[i]) {
+							alreadyApplied = true;
+							break;
+						}
+					}
+					if (alreadyApplied) {
+						++skippedControlled;
+						continue;
+					}
+				}
 
 				const auto& rest = (i < state.restTransforms.size())     ? state.restTransforms[i]         : kIdentRest;
 				Animation::Transform anim = state.localTransforms[i];
