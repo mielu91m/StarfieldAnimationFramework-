@@ -51,8 +51,8 @@ extern "C" uint16_t SAFAPI_GetFeatureLevel() { return 1; }
 extern "C" uint16_t SAFAPI_PlayAnimationFromGLTF(RE::Actor* a_actor, float a_transitionTime, const char* a_fileName, const SAFAPI_AnimationIdentifer& a_id)
 {
 	if (!a_actor || !a_fileName) return 0;
-	Animation::GraphManager::GetSingleton()->LoadAndStartAnimation(a_actor, std::string_view(a_fileName));
-	return 1;
+	bool ok = Animation::GraphManager::GetSingleton()->LoadAndStartAnimation(a_actor, std::string_view(a_fileName));
+	return ok ? 1u : 0u;
 }
 
 void SAFAPI_AttachCustomGenerator(RE::Actor* a_actor, SAFAPI_CustomGeneratorFunction a_generatorFunc, SAFAPI_CustomGeneratorFunction a_onDestroyFunc, void* a_userData, float a_transitionTime)

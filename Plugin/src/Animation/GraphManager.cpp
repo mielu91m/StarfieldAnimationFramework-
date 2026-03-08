@@ -46,6 +46,13 @@
 
 namespace Animation
 {
+	static std::string s_lastLoadError;
+
+	const std::string& GraphManager::GetLastLoadError()
+	{
+		return s_lastLoadError;
+	}
+
 	// ============================================================================
 	// GraphUpdateHook - główny punkt wejścia logiki animacji (jak w NAF)
 	// Hook podpięty do funkcji gry wywoływanej co klatkę - pozwala nadpisać
@@ -2921,20 +2928,23 @@ static bool InstallAnimGraphManagerCallHook()
 	// Implementacje metod GraphManager (przeniesione z .h - można rozbudować)
 	// ============================================================================
 
-	void GraphManager::LoadAndStartAnimation(RE::Actor* a_actor, std::string_view a_path, bool a_looping)
+	bool GraphManager::LoadAndStartAnimation(RE::Actor* a_actor, std::string_view a_path, bool a_looping, int a_animIndex)
 	{
+		s_lastLoadError.clear();
 		try {
 			SAF_LOG_INFO("LoadAndStartAnimation: actor={}, path={}",
 				static_cast<void*>(a_actor), a_path);
 			if (!a_actor) {
+				s_lastLoadError = "Actor is null.";
 				SAF_LOG_WARN("LoadAndStartAnimation: actor is null");
-				return;
+				return false;
 			}
 
 			auto skeleton = Settings::GetSkeleton(a_actor);
 			if (!skeleton || !skeleton->GetRawSkeleton()) {
+				s_lastLoadError = "No skeleton for this actor (wrong race or skeleton not loaded).";
 				SAF_LOG_WARN("LoadAndStartAnimation: missing skeleton for actor");
-				return;
+				return false;
 			}
 
 			std::filesystem::path path = Util::String::ResolveAnimationPath(a_path);
@@ -2954,36 +2964,43 @@ static bool InstallAnimGraphManagerCallHook()
 					}
 				}
 				if (!resolved) {
+					s_lastLoadError = "File not found: " + path.string() + " (.glb/.gltf)";
 					SAF_LOG_ERROR("LoadAndStartAnimation: missing file '{}' (.glb/.gltf not found)", path.string());
-					return;
+					return false;
 				}
 			} else if (!std::filesystem::exists(path)) {
+				s_lastLoadError = "File not found: " + path.string();
 				SAF_LOG_ERROR("LoadAndStartAnimation: file not found '{}'", path.string());
-				return;
+				return false;
 			}
 			SAF_LOG_INFO("LoadAndStartAnimation: loading file '{}'", path.string());
 
 			auto asset = Serialization::GLTFImport::LoadGLTF(path);
 			if (!asset) {
+				s_lastLoadError = "Failed to load GLTF: " + path.string();
 				SAF_LOG_ERROR("LoadAndStartAnimation: failed to load GLTF '{}'", path.string());
-				return;
+				return false;
 			}
 			if (asset->asset.animations.empty()) {
+				s_lastLoadError = "GLTF has no animations: " + path.string();
 				SAF_LOG_WARN("LoadAndStartAnimation: GLTF has no animations");
-				return;
+				return false;
 			}
-			SAF_LOG_INFO("LoadAndStartAnimation: GLTF animations={}, skeleton joints={}",
-				asset->asset.animations.size(), skeleton->jointNames.size());
+			size_t animIdx = static_cast<size_t>(std::max(0, a_animIndex));
+			if (animIdx >= asset->asset.animations.size()) animIdx = asset->asset.animations.size() - 1;
+			SAF_LOG_INFO("LoadAndStartAnimation: GLTF animations={}, using index {}, skeleton joints={}",
+				asset->asset.animations.size(), animIdx, skeleton->jointNames.size());
 
 			SAF_LOG_INFO("LoadAndStartAnimation: building raw animation");
 			auto rawAnim = Serialization::GLTFImport::CreateRawAnimation(
 				asset.get(),
-				&asset->asset.animations[0],
+				&asset->asset.animations[animIdx],
 				skeleton->GetRawSkeleton(),
 				&skeleton->jointNames);
 			if (!rawAnim || !rawAnim->data) {
+				s_lastLoadError = "Failed to build raw animation (check bone names match skeleton).";
 				SAF_LOG_ERROR("LoadAndStartAnimation: failed to build raw animation");
-				return;
+				return false;
 			}
 			SAF_LOG_INFO("LoadAndStartAnimation: raw animation built");
 
@@ -2991,8 +3008,9 @@ static bool InstallAnimGraphManagerCallHook()
 			SAF_LOG_INFO("LoadAndStartAnimation: building runtime animation");
 			auto runtimeAnim = builder(*rawAnim->data);
 			if (!runtimeAnim) {
+				s_lastLoadError = "Failed to build runtime animation.";
 				SAF_LOG_ERROR("LoadAndStartAnimation: failed to build runtime animation");
-				return;
+				return false;
 			}
 			SAF_LOG_INFO("LoadAndStartAnimation: runtime animation built");
 
@@ -3001,12 +3019,14 @@ static bool InstallAnimGraphManagerCallHook()
 			SAF_LOG_INFO("LoadAndStartAnimation: runtime tracks={}, soaTracks={}", trackCount, soaCount);
 			const auto jointCount = skeleton->jointNames.size();
 			if (trackCount == 0 || soaCount == 0) {
+				s_lastLoadError = "Invalid animation (no tracks).";
 				SAF_LOG_ERROR("LoadAndStartAnimation: invalid runtime animation (tracks={}, soa={})", trackCount, soaCount);
-				return;
+				return false;
 			}
 			if (trackCount > 4096 || soaCount > 4096) {
+				s_lastLoadError = "Animation track count out of range.";
 				SAF_LOG_ERROR("LoadAndStartAnimation: unreasonable track counts (tracks={}, soa={})", trackCount, soaCount);
-				return;
+				return false;
 			}
 			if (jointCount != 0 && trackCount != jointCount) {
 				SAF_LOG_WARN("LoadAndStartAnimation: track/joint mismatch (tracks={}, joints={})", trackCount, jointCount);
@@ -3032,10 +3052,15 @@ static bool InstallAnimGraphManagerCallHook()
 					it->second.currentAnimationPath = std::string(a_path);
 			}
 			SAF_LOG_INFO("LoadAndStartAnimation: generator attached");
+			return true;
 		} catch (const std::exception& e) {
+			s_lastLoadError = std::string("Exception: ") + e.what();
 			SAF_LOG_ERROR("LoadAndStartAnimation: exception {}", e.what());
+			return false;
 		} catch (...) {
+			s_lastLoadError = "Unknown exception.";
 			SAF_LOG_ERROR("LoadAndStartAnimation: unknown exception");
+			return false;
 		}
 	}
 
@@ -3194,6 +3219,27 @@ static bool InstallAnimGraphManagerCallHook()
 		it->second.playbackSpeed = a_speed;
 		if (auto* cg = dynamic_cast<Animation::ClipGenerator*>(it->second.generator.get()))
 			cg->SetSpeed(a_speed);
+	}
+
+	void GraphManager::SetAnimationLooping(RE::Actor* a_actor, bool a_loop)
+	{
+		if (!a_actor) return;
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		auto it = g_actorGraphs.find(a_actor->GetFormID());
+		if (it == g_actorGraphs.end()) return;
+		if (auto* cg = dynamic_cast<Animation::ClipGenerator*>(it->second.generator.get()))
+			cg->SetLooping(a_loop);
+	}
+
+	bool GraphManager::GetAnimationLooping(RE::Actor* a_actor) const
+	{
+		if (!a_actor) return false;
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		auto it = g_actorGraphs.find(a_actor->GetFormID());
+		if (it == g_actorGraphs.end()) return false;
+		if (auto* cg = dynamic_cast<Animation::ClipGenerator*>(it->second.generator.get()))
+			return cg->IsLooping();
+		return false;
 	}
 
 	float GraphManager::GetAnimationSpeed(RE::Actor* a_actor) const

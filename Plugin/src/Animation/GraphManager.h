@@ -21,10 +21,15 @@ namespace Animation
 		void InstallHooks();
 
 		// Metody sterujące wywoływane przez konsolę
-		void LoadAndStartAnimation(RE::Actor* a_actor, std::string_view a_path, bool a_looping = true);
+		/// Returns true on success. On false, use GetLastLoadError() for a short message (e.g. for console).
+		/// a_animIndex: which animation in the file (0-based; if out of range, uses first).
+		bool LoadAndStartAnimation(RE::Actor* a_actor, std::string_view a_path, bool a_looping = true, int a_animIndex = 0);
+		static const std::string& GetLastLoadError();
 		std::string GetCurrentAnimation(RE::Actor* a_actor) const;
 		void SetAnimationSpeed(RE::Actor* a_actor, float a_speed);
 		float GetAnimationSpeed(RE::Actor* a_actor) const;
+		void SetAnimationLooping(RE::Actor* a_actor, bool a_loop);
+		bool GetAnimationLooping(RE::Actor* a_actor) const;
 		void SetActorPosition(RE::Actor* a_actor, float a_x, float a_y, float a_z);
 		int GetSequencePhase(RE::Actor* a_actor) const;
 		bool SetSequencePhase(RE::Actor* a_actor, int a_phase);

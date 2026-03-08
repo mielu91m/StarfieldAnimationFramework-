@@ -10,6 +10,7 @@
 #include "ozz/base/maths/transform.h"
 #include "RE/Starfield.h" // Rozwiązuje błędy RE::Actor
 #include <optional>
+#include <unordered_map>
 
 namespace Settings
 {
@@ -55,4 +56,7 @@ namespace Settings
 	void SetFaceMorphs(const std::vector<std::string>& a_morphs);
 	const std::map<std::string, size_t>& GetFaceMorphIndexMap();
 	const std::vector<std::string>& GetFaceMorphs();
+
+	/// GLTF node name -> SAF skeleton joint name (from Data/SAF/GLTFBoneAliases.ini). Enables GLBs with different bone names (e.g. Blender/Mixamo) to play without re-export.
+	const std::unordered_map<std::string, std::string>& GetGLTFBoneAliases();
 }

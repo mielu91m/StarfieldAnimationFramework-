@@ -28,6 +28,8 @@
 #include <atomic>
 #include <unordered_map>
 #include <vector>
+#include <set>
+#include <filesystem>
 
 namespace Commands::SAFCommand
 {
@@ -42,6 +44,7 @@ namespace Commands::SAFCommand
 	{
 		std::string path;   // np. "R1" lub "Data/SAF/Animations/MyAnim.saf"
 		std::string actorId;  // pusty = player, inaczej FormID jako string
+		int animIndex = 0;   // który klip w pliku (0-based)
 	};
 	static std::queue<PendingPlay> g_pendingPlay;
 	static std::mutex g_pendingMutex;
@@ -236,7 +239,7 @@ namespace Commands::SAFCommand
 	void SetLastAnimInfo(std::string_view fileOrFullPath, RE::Actor* actor);
 	void RequestProcessPending();
 
-	// Zamknięcie konsoli na głównym wątku
+	// Zamknięcie konsoli – wywoływać TYLKO z głównego wątku (AddMessage nie jest thread-safe z wątku konsoli).
 	static void QueueCloseConsole()
 	{
 		SAF_LOG_INFO("[UI] QueueCloseConsole: hide console");
@@ -252,7 +255,7 @@ namespace Commands::SAFCommand
 			taskInterface->AddTask([]() {
 				SAF_LOG_INFO("[TASK] RequestProcessPending: ENTRY");
 				RequestProcessPending();
-				RequestCloseConsole();
+				RequestCloseConsole();  // ustaw flagę; główny wątek wykona QueueCloseConsole()
 				SAF_LOG_INFO("[TASK] RequestProcessPending: EXIT");
 			});
 			return;
@@ -390,7 +393,7 @@ namespace Commands::SAFCommand
 			SAF_LOG_INFO("[TASK] ExecutePlayTask: GraphManager={}", static_cast<void*>(mgr));
 
 			SAF_LOG_INFO("[TASK] ExecutePlayTask: calling LoadAndStartAnimation(actor={}, path='{}')", static_cast<void*>(actor), pathStr);
-			mgr->LoadAndStartAnimation(actor, pathStr);
+			(void)mgr->LoadAndStartAnimation(actor, pathStr);
 			SAF_LOG_INFO("[TASK] ExecutePlayTask: LoadAndStartAnimation returned");
 
 			SAF_LOG_INFO("[TASK] ExecutePlayTask: calling SetLastAnimInfo");
@@ -435,6 +438,93 @@ namespace Commands::SAFCommand
 		} catch (...) {
 			SAF_LOG_WARN("[SAF] SafePrintLn unknown exception");
 		}
+	}
+
+	static void ListAnimations()
+	{
+		std::set<std::string> names;
+		try {
+			const auto dir = Util::String::GetAnimationsPath();
+			if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) {
+				if (itfc) SafePrintLn(itfc, "SAF: Animations folder not found: " + dir.string());
+				return;
+			}
+			for (const auto& e : std::filesystem::directory_iterator(dir)) {
+				if (!e.is_regular_file()) continue;
+				std::string ext = e.path().extension().string();
+				if (ext.size() >= 2) {
+					for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+					if (ext == ".glb" || ext == ".gltf" || ext == ".saf")
+						names.insert(e.path().stem().string());
+				}
+			}
+		} catch (const std::exception& ex) {
+			if (itfc) SafePrintLn(itfc, std::string("SAF: Error listing animations: ") + ex.what());
+			return;
+		}
+		if (itfc) {
+			SafePrintLn(itfc, "SAF animations (Data/SAF/Animations):");
+			if (names.empty())
+				SafePrintLn(itfc, "  (none)");
+			else
+				for (const auto& n : names)
+					SafePrintLn(itfc, "  " + n);
+		}
+	}
+
+	static void ValidateAnimationPath(const std::string& pathKey)
+	{
+		if (!itfc) return;
+		auto resolvedPath = ResolveAnimationPathWithFallback(pathKey);
+		if (!std::filesystem::exists(resolvedPath)) {
+			SafePrintLn(itfc, "SAF validate: file not found: " + resolvedPath.string());
+			return;
+		}
+		auto asset = Serialization::GLTFImport::LoadGLTF(resolvedPath);
+		if (!asset) {
+			SafePrintLn(itfc, "SAF validate: failed to load GLTF: " + resolvedPath.string());
+			return;
+		}
+		RE::Actor* player = RE::PlayerCharacter::GetSingleton();
+		auto skeleton = Settings::GetSkeleton(player);
+		if (!skeleton || !skeleton->GetRawSkeleton()) {
+			SafePrintLn(itfc, "SAF validate: no skeleton (player race).");
+			return;
+		}
+		std::map<std::string, size_t> skeletonMap;
+		for (size_t i = 0; i < skeleton->jointNames.size(); i++)
+			skeletonMap[skeleton->jointNames[i]] = i;
+		const auto& boneAliases = Settings::GetGLTFBoneAliases();
+		size_t matched = 0;
+		std::vector<std::string> missing;
+		for (size_t i = 0; i < asset->asset.nodes.size(); i++) {
+			std::string nodeName(asset->asset.nodes[i].name);
+			if (auto it = asset->originalNames.find(i); it != asset->originalNames.end())
+				nodeName = it->second;
+			std::string lookupName = nodeName;
+			auto it = skeletonMap.find(lookupName);
+			if (it == skeletonMap.end() && !boneAliases.empty()) {
+				auto ait = boneAliases.find(nodeName);
+				if (ait != boneAliases.end()) lookupName = ait->second;
+				it = skeletonMap.find(lookupName);
+			}
+			if (it != skeletonMap.end())
+				matched++;
+			else
+				missing.push_back(nodeName);
+		}
+		SafePrintLn(itfc, "SAF validate: " + resolvedPath.filename().string());
+		SafePrintLn(itfc, "  Skeleton joints: " + std::to_string(skeleton->jointNames.size()) + ", GLTF nodes: " + std::to_string(asset->asset.nodes.size()));
+		SafePrintLn(itfc, "  Matched: " + std::to_string(matched));
+		if (!missing.empty()) {
+			SafePrintLn(itfc, "  Missing (add to GLTFBoneAliases.ini or re-export): " + std::to_string(missing.size()));
+			for (const auto& m : missing)
+				SafePrintLn(itfc, "    " + m);
+		}
+		if (asset->asset.animations.empty())
+			SafePrintLn(itfc, "  Warning: no animations in file.");
+		else
+			SafePrintLn(itfc, "  Animations in file: " + std::to_string(asset->asset.animations.size()));
 	}
 
 	// Maks. liczba komend przetwarzanych w jednej klatce – zapobiega zawieszce przy .bat / wielu komendach
@@ -483,6 +573,10 @@ namespace Commands::SAFCommand
 		SafePrintLn(itfc, "saf play <path> [actorID ...] - Odtwarza animację. Jedna osoba: saf play tw lub saf play tw <refID>.");
 		SafePrintLn(itfc, "  Wiele osób (ta sama animacja): saf play tw player 0x123 0x456 (gracz + NPC + NPC).");
 		SafePrintLn(itfc, "saf stop [actorID ...] - Zatrzymuje animację SAF. Bez argumentu: celownik/gracz. Wiele: saf stop player 0x123.");
+		SafePrintLn(itfc, "saf list - Lists animation names in Data/SAF/Animations (.glb/.gltf/.saf).");
+		SafePrintLn(itfc, "saf speed [actorID] <value> - Set playback speed (default: crosshair/player).");
+		SafePrintLn(itfc, "saf loop [actorID] 0|1 - Set looping off/on (default: crosshair/player).");
+		SafePrintLn(itfc, "saf validate <path> - Check GLB/GLTF bone names vs SAF skeleton (report missing).");
 		SafePrintLn(itfc, "saf optimize <file> [compression_level] - Optimizes GLTF to SAF");
 		SafePrintLn(itfc, "saf dumpbones [actorID] - Dumps actor 3D bone hierarchy to Data/SAF/Skeletons");
 		SafePrintLn(itfc, "saf offset2id <hex_rva> - Address Library: convert RVA (offset in exe) to ID for this game version. Example: saf offset2id 1A2B3C4D");
@@ -540,17 +634,12 @@ namespace Commands::SAFCommand
 	}
 
 	// Dodaje zlecenie play do kolejki – BEZ wywołań RE (bezpieczne z wątku konsoli)
-	void PushPendingPlay(std::string path, std::string actorId)
+	void PushPendingPlay(std::string path, std::string actorId, int animIndex = 0)
 	{
-		SAF_LOG_INFO("[QUEUE] PushPendingPlay: START - path='{}', actorId='{}'", path, actorId);
-		std::stringstream ss;
-		ss << std::this_thread::get_id();
-		SAF_LOG_INFO("[QUEUE] PushPendingPlay: thread_id={}", ss.str());
+		SAF_LOG_INFO("[QUEUE] PushPendingPlay: START - path='{}', actorId='{}', animIndex={}", path, actorId, animIndex);
 		std::lock_guard<std::mutex> lock(g_pendingMutex);
-		SAF_LOG_INFO("[QUEUE] PushPendingPlay: lock acquired, queue size before: {}", g_pendingPlay.size());
-		g_pendingPlay.push(PendingPlay{ std::move(path), std::move(actorId) });
-		g_hasPendingCommands.store(true, std::memory_order_release);  // Ustaw flagę atomową
-		SAF_LOG_INFO("[QUEUE] PushPendingPlay: DONE - queue size after: {}, flag set, mutex will unlock", g_pendingPlay.size());
+		g_pendingPlay.push(PendingPlay{ std::move(path), std::move(actorId), animIndex });
+		g_hasPendingCommands.store(true, std::memory_order_release);
 	}
 
 	void ProcessPlayCommand(uint64_t idxStart = 1, bool verbose = true)
@@ -568,13 +657,45 @@ namespace Commands::SAFCommand
 
 		std::string path(ToSV(args[idxStart]));
 		std::vector<std::string> actorIds;
+		int animIndex = 0;
+		size_t actorStart = idxStart + 1;
 
 		if (args.size() > idxStart + 1) {
-			// Jawna lista aktorów: args[idxStart+1] .. args[args.size()-1] – ta sama animacja na każdym (player + NPC, NPC + NPC, itd.)
-			for (size_t i = idxStart + 1; i < args.size(); ++i) {
+			// Opcjonalnie pierwszy argument to indeks animacji w pliku (0–9), np. saf play kiss 1 player = drugi klip.
+			// Tylko 0–9 traktujemy jako indeks, żeby "14" (FormID gracza) nie było zjadane jako animIndex.
+			auto firstArg = std::string(ToSV(args[idxStart + 1]));
+			auto parsed = Util::String::StrToInt(firstArg);
+			if (parsed.has_value() && *parsed >= 0 && *parsed <= 9) {
+				animIndex = *parsed;
+				actorStart = idxStart + 2;
+			}
+			for (size_t i = actorStart; i < args.size(); ++i) {
 				actorIds.push_back(std::string(ToSV(args[i])));
 			}
-			SAF_LOG_INFO("[CMD] ProcessPlayCommand: multi-actor path='{}', {} actor IDs", path, actorIds.size());
+			// Gdy podano tylko indeks bez aktorów (saf play kiss 1) – rozwiąż jednego aktora jak poniżej
+			if (actorIds.empty()) {
+				RE::Actor* one = nullptr;
+				auto* mgrMain = Animation::GraphManager::GetSingleton();
+				if (mgrMain) {
+					if (auto* consoleRef = GetConsoleReference(); consoleRef && consoleRef->IsActor())
+						one = static_cast<RE::Actor*>(consoleRef);
+				}
+				if (!one && itfc && mgrMain) {
+					try {
+						RE::NiPointer<RE::TESObjectREFR> sel = itfc->GetSelectedReference();
+						if (sel && sel->IsActor()) one = static_cast<RE::Actor*>(sel.get());
+					} catch (...) {}
+				}
+				if (!one && mgrMain) one = GetPlayerOrCrosshairActor();
+				if (one) {
+					char buf[16];
+					std::snprintf(buf, sizeof(buf), "%08X", one->GetFormID());
+					actorIds.push_back(buf);
+				} else {
+					actorIds.push_back("player");
+				}
+			}
+			SAF_LOG_INFO("[CMD] ProcessPlayCommand: path='{}', animIndex={}, {} actor IDs", path, animIndex, actorIds.size());
 		} else {
 			// Jedna osoba: brak argumentu lub "path refID" w jednym tokenie.
 			std::string actorId;
@@ -638,9 +759,9 @@ namespace Commands::SAFCommand
 			actorIds.push_back(std::move(actorId));
 		}
 
-		// Kolejkuj jedno odtwarzanie na aktora (ta sama ścieżka) – ProcessPendingCommands wykona je w jednej paczce.
+		// Kolejkuj jedno odtwarzanie na aktora (ta sama ścieżka, ten sam indeks klipu).
 		for (std::string& aid : actorIds) {
-			PushPendingPlay(path, aid);
+			PushPendingPlay(path, aid, animIndex);
 		}
 		SAF_LOG_INFO("[CMD] ProcessPlayCommand: queued {} play(s) for path='{}'", actorIds.size(), path);
 
@@ -658,7 +779,7 @@ namespace Commands::SAFCommand
 		}
 
 		QueueProcessPending();
-		QueueCloseConsole();
+		RequestCloseConsole();
 
 		SAF_LOG_INFO("[CMD] ProcessPlayCommand: DONE");
 	}
@@ -735,7 +856,7 @@ namespace Commands::SAFCommand
 		if (args.size() < 1) {
 			SAF_LOG_INFO("[MCF] Run: no args, showing help");
 			if (itfc) ShowHelp();
-			QueueCloseConsole();
+			RequestCloseConsole();
 			SAF_LOG_INFO("[MCF] Run: EXIT (help shown)");
 			return;
 		}
@@ -748,7 +869,7 @@ namespace Commands::SAFCommand
 			if (cmd == "help") {
 			SAF_LOG_INFO("[MCF] Run: handling 'help' command");
 			if (itfc) ShowHelp();
-			QueueCloseConsole();
+			RequestCloseConsole();
 			SAF_LOG_INFO("[MCF] Run: EXIT (help)");
 			return;
 		}
@@ -805,7 +926,7 @@ namespace Commands::SAFCommand
 					SafePrintLn(itfc, toStop.size() > 1 ? "Animation stopped on " + std::to_string(toStop.size()) + " actors." : "Animation stopped.");
 			}
 
-			QueueCloseConsole();
+			RequestCloseConsole();
 			return;
 		}
 		if (cmd == "override") {
@@ -816,7 +937,7 @@ namespace Commands::SAFCommand
 			std::string key(ToSV(args[1]));
 			std::string value(ToSV(args[2]));
 			SetAnimOverride(key, value);
-			QueueCloseConsole();
+			RequestCloseConsole();
 			return;
 		}
 		if (cmd == "clearoverride") {
@@ -825,17 +946,78 @@ namespace Commands::SAFCommand
 				key = std::string(ToSV(args[1]));
 			}
 			ClearAnimOverride(key);
-			QueueCloseConsole();
+			RequestCloseConsole();
 			return;
 		}
 		if (cmd == "listoverride") {
 			ListAnimOverrides();
-			QueueCloseConsole();
+			RequestCloseConsole();
 			return;
 		}
 		if (cmd == "listalias") {
 			ListAnimAliases();
-			QueueCloseConsole();
+			RequestCloseConsole();
+			return;
+		}
+		if (cmd == "list") {
+			ListAnimations();
+			RequestCloseConsole();
+			return;
+		}
+		if (cmd == "speed") {
+			RE::Actor* actor = nullptr;
+			float value = 1.0f;
+			if (args.size() >= 3) {
+				actor = StrToActor(ToSV(args[1]), itfc != nullptr);
+				auto v = Util::String::StrToFloat(std::string(ToSV(args[2])));
+				if (v.has_value()) value = *v;
+			} else if (args.size() == 2) {
+				auto v = Util::String::StrToFloat(std::string(ToSV(args[1])));
+				if (v.has_value()) { value = *v; actor = GetPlayerOrCrosshairActor(); }
+				else { actor = StrToActor(ToSV(args[1]), itfc != nullptr); }
+			} else {
+				actor = GetPlayerOrCrosshairActor();
+			}
+			if (actor && Animation::GraphManager::GetSingleton()) {
+				Animation::GraphManager::GetSingleton()->SetAnimationSpeed(actor, value);
+				if (itfc) SafePrintLn(itfc, "SAF: Speed set to " + std::to_string(value) + ".");
+			} else if (itfc) SafePrintLn(itfc, "SAF: No actor or no animation.");
+			RequestCloseConsole();
+			return;
+		}
+		if (cmd == "loop") {
+			RE::Actor* actor = nullptr;
+			bool loop = true;
+			if (args.size() >= 3) {
+				actor = StrToActor(ToSV(args[1]), itfc != nullptr);
+				std::string v(ToSV(args[2]));
+				loop = (v == "1" || v == "true" || v == "yes");
+			} else if (args.size() == 2) {
+				std::string v(ToSV(args[1]));
+				if (v == "0" || v == "1" || v == "true" || v == "false" || v == "yes" || v == "no") {
+					loop = (v == "1" || v == "true" || v == "yes");
+					actor = GetPlayerOrCrosshairActor();
+				} else {
+					actor = StrToActor(ToSV(args[1]), itfc != nullptr);
+				}
+			} else {
+				actor = GetPlayerOrCrosshairActor();
+			}
+			if (actor && Animation::GraphManager::GetSingleton()) {
+				Animation::GraphManager::GetSingleton()->SetAnimationLooping(actor, loop);
+				if (itfc) SafePrintLn(itfc, std::string("SAF: Loop ") + (loop ? "on." : "off."));
+			} else if (itfc) SafePrintLn(itfc, "SAF: No actor or no animation.");
+			RequestCloseConsole();
+			return;
+		}
+		if (cmd == "validate") {
+			if (args.size() < 2) {
+				if (itfc) SafePrintLn(itfc, "Usage: saf validate <path>   (path = animation name in Data/SAF/Animations)");
+				RequestCloseConsole();
+				return;
+			}
+			ValidateAnimationPath(std::string(ToSV(args[1])));
+			RequestCloseConsole();
 			return;
 		}
 		if (cmd == "dumpbones") {
@@ -853,7 +1035,7 @@ namespace Commands::SAFCommand
 			}
 			g_dumpRequested.store(true, std::memory_order_release);
 			SAF_LOG_INFO("[DUMP] dumpbones queued");
-			QueueCloseConsole();
+			RequestCloseConsole();
 			SAF_LOG_INFO("[MCF] Run: EXIT (dumpbones queued)");
 			return;
 		}
@@ -862,7 +1044,7 @@ namespace Commands::SAFCommand
 		if (cmd == "offset2id") {
 			if (args.size() < 2) {
 				SafePrintLn(itfc, "Usage: saf offset2id <hex_rva>   (RVA = offset in Starfield.exe, from IDA)");
-				QueueCloseConsole();
+				RequestCloseConsole();
 				return;
 			}
 			std::string hexStr(Trim(ToSV(args[1])));
@@ -873,7 +1055,7 @@ namespace Commands::SAFCommand
 				offset = std::stoull(hexStr, nullptr, 16);
 			} catch (...) {
 				SafePrintLn(itfc, "Error: invalid hex value");
-				QueueCloseConsole();
+				RequestCloseConsole();
 				return;
 			}
 			try {
@@ -891,7 +1073,7 @@ namespace Commands::SAFCommand
 				SafePrintLn(itfc, errMsg);
 				SAF_LOG_ERROR("offset2id failed: {}", e.what());
 			}
-			QueueCloseConsole();
+			RequestCloseConsole();
 			return;
 		}
 
@@ -908,7 +1090,7 @@ namespace Commands::SAFCommand
 			SAF_LOG_WARN("[MCF] Run: unknown command '{}'", cmd);
 			SAF_LOG_INFO("[MCF] Run: EXIT (unknown command)");
 		}
-		QueueCloseConsole();
+		RequestCloseConsole();
 		} catch (const std::exception& e) {
 			SAF_LOG_WARN("[SAF] Run command exception: {}", e.what());
 		} catch (...) {
@@ -1020,21 +1202,27 @@ namespace Commands::SAFCommand
 			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: resolving path for '{}'", resolvedKey);
 			auto resolvedPath = ResolveAnimationPathWithFallback(resolvedKey);
 			std::string pathStr = resolvedPath.string();
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: resolved path='{}'", pathStr);
+			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: resolved path='{}', animIndex={}", pathStr, cmd.animIndex);
 
 			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: calling GraphManager::GetSingleton()");
 			auto* mgr = Animation::GraphManager::GetSingleton();
 			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: GraphManager={}", static_cast<void*>(mgr));
 			
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: calling LoadAndStartAnimation(actor={}, path='{}')", static_cast<void*>(actor), pathStr);
+			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: calling LoadAndStartAnimation(actor={}, path='{}', animIndex={})", static_cast<void*>(actor), pathStr, cmd.animIndex);
+			bool ok = false;
 			try {
-				mgr->LoadAndStartAnimation(actor, pathStr);
+				ok = mgr->LoadAndStartAnimation(actor, pathStr, true, cmd.animIndex);
 			} catch (const std::exception& e) {
 				SAF_LOG_ERROR("[PROCESS] ProcessPendingCommands: exception {}", e.what());
 			} catch (...) {
 				SAF_LOG_ERROR("[PROCESS] ProcessPendingCommands: unknown exception");
 			}
 			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: LoadAndStartAnimation returned");
+			if (!ok && itfc) {
+				const std::string& err = Animation::GraphManager::GetLastLoadError();
+				if (!err.empty())
+					SafePrintLn(itfc, "SAF: " + err);
+			}
 			if (mgr) {
 				SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: requesting graph update");
 				mgr->RequestGraphUpdate();
@@ -1056,7 +1244,7 @@ namespace Commands::SAFCommand
 		// Zamknij konsolę po wykonaniu komendy (jesteśmy na głównym wątku).
 		if (processed > 0) {
 			if (auto* mgr = Animation::GraphManager::GetSingleton(); mgr && mgr->IsMainThread()) {
-				QueueCloseConsole();
+				RequestCloseConsole();
 			}
 		}
 	}
@@ -1095,7 +1283,7 @@ namespace Commands::SAFCommand
 
 	void CloseConsoleMainThread()
 	{
-		QueueCloseConsole();
+		QueueCloseConsole();  // faktyczne zamknięcie konsoli (tylko z głównego wątku)
 	}
 
 	bool HasPendingDump()

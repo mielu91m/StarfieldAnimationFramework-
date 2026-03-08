@@ -422,6 +422,8 @@ std::unique_ptr<Animation::RawOzzAnimation> GLTFImport::CreateRawAnimation(
 		identity.scale = ozz::math::Float3::one();
 	std::vector<ozz::math::Transform> bindPose(jointCount, identity);
 
+		const auto& boneAliases = Settings::GetGLTFBoneAliases();
+
 		for (size_t i = 0; i < asset.nodes.size(); ++i) {
 			const auto& n = asset.nodes[i];
 			std::string nodeName = std::string(n.name);
@@ -430,7 +432,14 @@ std::unique_ptr<Animation::RawOzzAnimation> GLTFImport::CreateRawAnimation(
 				nodeName = iter->second;
 			}
 
-	if (auto iter = skeletonMap.find(nodeName); iter != skeletonMap.end()) {
+			std::string lookupName = nodeName;
+			auto iter = skeletonMap.find(lookupName);
+			if (iter == skeletonMap.end() && !boneAliases.empty()) {
+				auto ait = boneAliases.find(nodeName);
+				if (ait != boneAliases.end()) lookupName = ait->second;
+				iter = skeletonMap.find(lookupName);
+			}
+			if (iter != skeletonMap.end()) {
 		const size_t jointIndex = iter->second;
 		skeletonIdxs[i] = jointIndex;
 				if (std::holds_alternative<fastgltf::TRS>(n.transform)) {

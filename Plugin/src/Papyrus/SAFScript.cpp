@@ -42,7 +42,7 @@ namespace Papyrus::SAFScript
 			return resolved;
 		}
 
-		bool PlayOnActorImpl(RE::Actor* a_actor, std::string_view a_animId)
+		bool PlayOnActorImpl(RE::Actor* a_actor, std::string_view a_animId, int a_animIndex = 0)
 		{
 			if (!a_actor) {
 				SAF_LOG_WARN("[Papyrus] PlayOnActorImpl: actor is null");
@@ -60,10 +60,10 @@ namespace Papyrus::SAFScript
 			std::string pathStr = resolvedPath.string();
 
 			try {
-				SAF_LOG_INFO("[Papyrus] PlayOnActorImpl: playing '{}' on actor {:08X}", pathStr, a_actor->GetFormID());
-				mgr->LoadAndStartAnimation(a_actor, pathStr);
-				mgr->RequestGraphUpdate();
-				return true;
+				SAF_LOG_INFO("[Papyrus] PlayOnActorImpl: playing '{}' index {} on actor {:08X}", pathStr, a_animIndex, a_actor->GetFormID());
+				bool ok = mgr->LoadAndStartAnimation(a_actor, pathStr, true, a_animIndex);
+				if (ok) mgr->RequestGraphUpdate();
+				return ok;
 			} catch (const std::exception& e) {
 				SAF_LOG_ERROR("[Papyrus] PlayOnActorImpl: exception '{}'", e.what());
 				return false;
@@ -143,13 +143,14 @@ namespace Papyrus::SAFScript
 		Papyrus::EventManager::GetSingleton()->UnregisterScript(Papyrus::EventType::kSequenceEnd, handle);
 	}
 
-	// Papyrus: SAFScript.PlayOnActor(Actor akActor, string animId) -> bool
+	// Papyrus: SAFScript.PlayOnActor(Actor akActor, string animId, int animIndex=0) -> bool
 	bool PlayOnActor(
 		RE::BSScript::IVirtualMachine& /*a_vm*/,
 		std::uint32_t /*a_stackID*/,
 		RE::BSScript::Object& /*a_script*/,
 		RE::Actor* a_actor,
-		RE::BSFixedString a_animId)
+		RE::BSFixedString a_animId,
+		int a_animIndex)
 	{
 		if (!a_actor) {
 			SAF_LOG_WARN("[Papyrus] PlayOnActor: actor is none");
@@ -159,15 +160,16 @@ namespace Papyrus::SAFScript
 			SAF_LOG_WARN("[Papyrus] PlayOnActor: animId is empty");
 			return false;
 		}
-		return PlayOnActorImpl(a_actor, a_animId.c_str());
+		return PlayOnActorImpl(a_actor, a_animId.c_str(), a_animIndex >= 0 ? a_animIndex : 0);
 	}
 
-	// Papyrus: SAFScript.PlayOnPlayer(string animId) -> bool
+	// Papyrus: SAFScript.PlayOnPlayer(string animId, int animIndex=0) -> bool
 	bool PlayOnPlayer(
 		RE::BSScript::IVirtualMachine& /*a_vm*/,
 		std::uint32_t /*a_stackID*/,
 		RE::BSScript::Object& /*a_script*/,
-		RE::BSFixedString a_animId)
+		RE::BSFixedString a_animId,
+		int a_animIndex)
 	{
 		if (!a_animId.data()) {
 			SAF_LOG_WARN("[Papyrus] PlayOnPlayer: animId is empty");
@@ -180,7 +182,35 @@ namespace Papyrus::SAFScript
 			return false;
 		}
 
-		return PlayOnActorImpl(player, a_animId.c_str());
+		return PlayOnActorImpl(player, a_animId.c_str(), a_animIndex >= 0 ? a_animIndex : 0);
+	}
+
+	// Papyrus: SAFScript.PlayOnActors(Actor[] akActors, string animId, int animIndex=0) -> bool
+	bool PlayOnActors(
+		RE::BSScript::IVirtualMachine& /*a_vm*/,
+		std::uint32_t /*a_stackID*/,
+		RE::BSScript::Object& /*a_script*/,
+		std::vector<RE::Actor*> a_actors,
+		RE::BSFixedString a_animId,
+		int a_animIndex)
+	{
+		if (!a_animId.data()) {
+			SAF_LOG_WARN("[Papyrus] PlayOnActors: animId is empty");
+			return false;
+		}
+		if (a_actors.empty()) {
+			SAF_LOG_WARN("[Papyrus] PlayOnActors: actor array is empty");
+			return false;
+		}
+		int idx = a_animIndex >= 0 ? a_animIndex : 0;
+		bool anyOk = false;
+		for (RE::Actor* a : a_actors) {
+			if (a && PlayOnActorImpl(a, a_animId.c_str(), idx))
+				anyOk = true;
+		}
+		if (anyOk && Animation::GraphManager::GetSingleton())
+			Animation::GraphManager::GetSingleton()->RequestGraphUpdate();
+		return anyOk;
 	}
 
 	// Papyrus: SAFScript.StopAnimation(Actor akActor) -> bool
@@ -331,6 +361,14 @@ namespace Papyrus::SAFScript
 				className,
 				"PlayOnPlayer",
 				PlayOnPlayer,
+				std::nullopt,
+				false
+			);
+
+			a_vm->BindNativeMethod(
+				className,
+				"PlayOnActors",
+				PlayOnActors,
 				std::nullopt,
 				false
 			);

@@ -15,6 +15,7 @@ namespace Animation
 		void SetDeltaTime(float a_dt);
 		void SetSpeed(float a_speed);
 		void SetLooping(bool a_loop);
+		bool IsLooping() const { return _looping; }
 		float GetSpeed() const { return _speed; }
 		float GetDuration() const;
 		float GetCurrentTime() const { return _time; }

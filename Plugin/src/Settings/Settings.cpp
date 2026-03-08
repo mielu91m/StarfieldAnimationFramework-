@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cctype>
+#include <fstream>
 
 namespace Settings
 {
@@ -203,5 +204,44 @@ namespace Settings
 	{
 		if (!a_skele) return false;
 		return a_skele->name == "default" || a_skele->name == "Default";
+	}
+
+	// GLTF node name -> SAF skeleton joint name (from Data/SAF/GLTFBoneAliases.ini)
+	static std::unordered_map<std::string, std::string> g_gltfBoneAliases;
+	static bool g_gltfBoneAliasesLoaded = false;
+
+	static void TrimInPlace(std::string& s)
+	{
+		auto start = s.find_first_not_of(" \t\r\n");
+		if (start == std::string::npos) { s.clear(); return; }
+		auto end = s.find_last_not_of(" \t\r\n");
+		s = s.substr(start, end == std::string::npos ? std::string::npos : (end - start + 1));
+	}
+
+	const std::unordered_map<std::string, std::string>& GetGLTFBoneAliases()
+	{
+		if (g_gltfBoneAliasesLoaded) return g_gltfBoneAliases;
+		g_gltfBoneAliasesLoaded = true;
+		const auto path = Util::String::GetDataPath() / "SAF" / "GLTFBoneAliases.ini";
+		std::ifstream file(path);
+		if (!file.is_open()) {
+			SAF_LOG_INFO("GLTFBoneAliases: no file at '{}' (optional)", path.string());
+			return g_gltfBoneAliases;
+		}
+		std::string line;
+		while (std::getline(file, line)) {
+			TrimInPlace(line);
+			if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+			auto pos = line.find('=');
+			if (pos == std::string::npos) continue;
+			std::string key = line.substr(0, pos);
+			std::string value = line.substr(pos + 1);
+			TrimInPlace(key);
+			TrimInPlace(value);
+			if (!key.empty() && !value.empty())
+				g_gltfBoneAliases[key] = value;
+		}
+		SAF_LOG_INFO("GLTFBoneAliases: loaded {} entries from {}", g_gltfBoneAliases.size(), path.string());
+		return g_gltfBoneAliases;
 	}
 }
