@@ -1,0 +1,173 @@
+================================================================================
+  SAF – Poradnik tworzenia moda kompatybilnego z Papyrusem
+  Starfield Animation Framework – odtwarzanie animacji przez skrypty
+================================================================================
+
+1. WYMAGANIA
+--------------------------------------------------------------------------------
+  • Starfield (aktualna wersja)
+  • SFSE (Starfield Script Extender)
+  • MCF (Modern Command Framework)
+  • Address Library for Starfield
+  • StarfieldAnimationFramework (SAF) – plugin + skrypty
+
+  Twój mod musi mieć w zależnościach: SAF, MCF, Address Library.
+
+
+2. INSTALACJA PLIKÓW SAF (dla twórcy moda)
+--------------------------------------------------------------------------------
+  Skopiuj do swojego moda:
+
+  • StarfieldAnimationFramework.dll  →  Data\SFSE\Plugins\
+  • SAF.pex, SAFScript.pex           →  Data\Scripts\
+  • SAF.psc, SAFScript.pex           →  Data\Scripts\Source\
+
+  (Opcjonalnie: Game.psc – stub do kompilacji, jeśli używasz PlayOnTargetOrPlayer)
+
+  Animacje (.glb, .gltf) umieść w:  Data\SAF\Animations\
+
+
+3. IMPORT W SKRYPCIE PAPYRUSA
+--------------------------------------------------------------------------------
+  Na początku skryptu (po Scriptname, przed Properties) dodaj:
+
+    Import SAF
+
+  UWAGA: Litera „S”, „A”, „F” musi być WIELKA – Papyrus rozróżnia wielkość liter.
+  Błędne:  import saf   →  nie zadziała
+  Poprawne: Import SAF  →  działa
+
+
+4. PODSTAWOWE FUNKCJE API
+--------------------------------------------------------------------------------
+
+  Odtwarzanie animacji na konkretnym aktorze:
+  ------------------------------------------
+    SAF.PlayAnimation(Actor akTarget, String asAnim, Float fSpeed = 1.0)
+
+    Przykład:
+      SAF.PlayAnimation(Game.GetPlayer(), "test", 1.0)
+      SAF.PlayAnimation(akNPC, "GE\\scena1.glb", 0.5)
+
+    • akTarget – aktor, na którym odtwarzana jest animacja
+    • asAnim   – nazwa pliku animacji (np. "test", "test.glb", "folder\\anim.glb")
+    • fSpeed   – prędkość odtwarzania (1.0 = normalna, 2.0 = 2× szybciej, 0.5 = wolniej)
+
+
+  Odtwarzanie na celowniku lub graczu (jak w konsoli „saf play”):
+  ----------------------------------------------------------------
+    SAF.PlayOnTargetOrPlayer(String asAnim, Float fSpeed = 1.0)
+
+    Jeśli celownik jest na NPC – animacja na tym NPC.
+    Jeśli nie – animacja na graczu.
+
+    Przykład:
+      SAF.PlayOnTargetOrPlayer("test", 1.0)
+
+
+  Odtwarzanie bez pętli (jednorazowo):
+  ------------------------------------
+    SAF.PlayAnimationOnce(Actor akTarget, String asAnim, Float fSpeed = 1.0)
+
+
+  Zatrzymanie animacji:
+  ---------------------
+    SAF.StopAnimation(Actor akTarget)
+
+
+  Synchronizacja wielu aktorów (ta sama animacja):
+  ------------------------------------------------
+    SAF.SyncAnimations(Actor[] akTargets)
+    SAF.StopSyncing(Actor akTarget)
+
+
+  Prędkość i pozycja:
+  -------------------
+    SAF.SetAnimationSpeed(Actor akTarget, Float fSpeed)
+    SAF.GetAnimationSpeed(Actor akTarget)
+    SAF.SetPositionLocked(Actor akTarget, Bool bLocked)
+    SAF.SetActorPosition(Actor akTarget, Float fX, Float fY, Float fZ)
+
+
+  Informacje:
+  -----------
+    SAF.GetCurrentAnimation(Actor akTarget)  →  zwraca ścieżkę aktualnej animacji
+
+
+5. NAZWA ANIMACJI (asAnim)
+--------------------------------------------------------------------------------
+  Używaj dokładnie tej samej nazwy, która działa w konsoli przy „saf play”.
+
+  • "test"        – szuka test.glb / test.gltf w Data\SAF\Animations\
+  • "test.glb"    – to samo
+  • "GE\\scena1"  – ścieżka względna w folderze animacji (np. GE\scena1.glb)
+
+
+6. CZĘSTE BŁĘDY
+--------------------------------------------------------------------------------
+  ❌ import saf                    →  wielkość liter ma znaczenie
+  ✅ Import SAF
+
+  ❌ saf.PlayAnimation(...)        →  „saf” to zmienna, nie typ
+  ✅ SAF.PlayAnimation(...)        →  wywołanie na typie SAF
+
+  ❌ Stary GergelEbanexQuestScript.pex  →  po zmianie .psc trzeba skompilować!
+  ✅ Skompiluj ponownie swój skrypt do .pex i wgraj do Data\Scripts\
+
+  ❌ Brak SAF.pex / SAFScript.pex w Data\Scripts\  →  gra nie znajdzie API
+  ✅ Upewnij się, że oba .pex są w paczce moda
+
+
+7. TESTOWANIE I DEBUGOWANIE
+--------------------------------------------------------------------------------
+  Log SAF:
+    Documents\My Games\Starfield\SFSE\Logs\StarfieldAnimationFramework.log
+
+  Po wywołaniu SAF.PlayAnimation(...) w logu powinna pojawić się linia:
+    [Papyrus] PlayOnActorImpl: playing '...' index ... on actor ...
+
+  Jeśli tej linii NIE MA – wywołanie nie dociera do SAF. Sprawdź:
+    • Czy Import SAF jest poprawny (wielkie litery)
+    • Czy używasz SAF.PlayAnimation (nie saf.PlayAnimation)
+    • Czy GergelEbanexQuestScript.pex (lub inny skrypt) jest skompilowany po zmianach
+    • Czy SAF.pex i SAFScript.pex są w Data\Scripts\
+
+
+  Prosty test – dodaj przed wywołaniem:
+    Debug.Notification("Wywołuję SAF.PlayAnimation")
+    SAF.PlayAnimation(akActor, "test", 1.0)
+
+  Jeśli notyfikacja się pojawia, ale w logu SAF nadal brak [Papyrus] – 
+  gra prawdopodobnie ładuje stare lub inne wersje SAF.pex/SAFScript.pex.
+
+
+8. SEKWENCJE I ZDARZENIA (zaawansowane)
+--------------------------------------------------------------------------------
+  SAF.StartSequence(Actor akTarget, SequencePhase[] sPhases, Bool bLoop)
+  SAF.AdvanceSequence(Actor akTarget, Bool bSmooth)
+  SAF.GetSequencePhase(Actor akTarget)
+  SAF.SetSequencePhase(Actor akTarget, Int iPhase)
+
+  Rejestracja zdarzeń:
+    SAF.RegisterForPhaseBegin(ScriptObject sScript, String sFunctionName)
+    SAF.RegisterForSequenceEnd(ScriptObject sScript, String sFunctionName)
+    SAF.UnregisterForPhaseBegin(ScriptObject sScript)
+    SAF.UnregisterForSequenceEnd(ScriptObject sScript)
+
+
+9. NATYWNE API (SAFScript) – dla zaawansowanych
+--------------------------------------------------------------------------------
+  Możesz też używać bezpośrednio:
+
+    Import SAFScript
+
+    SAFScript.PlayOnActor(Actor akActor, String animId, Float fSpeed = 1.0, Int animIndex = 0)
+    SAFScript.PlayOnPlayer(String animId, Float fSpeed = 1.0, Int animIndex = 0)
+    SAFScript.PlayOnActors(Actor[] akActors, String animId, Int animIndex = 0)
+
+  animIndex – indeks animacji w pliku (0 = pierwsza, 1 = druga itd.)
+
+
+================================================================================
+  GitHub: https://github.com/mielu91m/StarfieldAnimationFramework
+================================================================================
