@@ -111,9 +111,6 @@
   ❌ saf.PlayAnimation(...)        →  „saf” to zmienna, nie typ
   ✅ SAF.PlayAnimation(...)        →  wywołanie na typie SAF
 
-  ❌ Stary GergelEbanexQuestScript.pex  →  po zmianie .psc trzeba skompilować!
-  ✅ Skompiluj ponownie swój skrypt do .pex i wgraj do Data\Scripts\
-
   ❌ Brak SAF.pex / SAFScript.pex w Data\Scripts\  →  gra nie znajdzie API
   ✅ Upewnij się, że oba .pex są w paczce moda
 
