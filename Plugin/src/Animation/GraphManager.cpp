@@ -814,9 +814,10 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		// Used to keep face bones stable when the animation doesn't animate them.
 		std::vector<std::uint8_t> jointHasChannel;
 		std::vector<Animation::Transform> localTransforms;
-		std::vector<Animation::Transform> restTransforms;     // OZZ bind-pose, or actor rest when UseActorRestPose
-		std::vector<Animation::Transform> actorRestTransforms; // captured from actor when building joint map (if UseActorRestPose)
-		std::vector<std::array<float,9>> gameBaseRotations;   // game's original bone matrices, captured once
+		std::vector<Animation::Transform> restTransforms;       // OZZ bind-pose, or actor rest when UseActorRestPose
+		std::vector<Animation::Transform> actorRestTransforms;  // captured from actor when building joint map (if UseActorRestPose)
+		std::vector<std::array<float,9>> gameBaseRotations;     // game's original bone rotation matrices, captured once
+		std::vector<std::array<float,3>> gameBaseTranslations;  // game's original bone translations, captured once
 		bool jointMapBuilt = false;
 		RE::NiAVObject* cachedActor3DRoot = nullptr;  // when 3D is recreated (e.g. after closing console), we must rebuild
 		bool loggedFirstUpdate = false;
@@ -1163,6 +1164,19 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 			p[0]=a_rot9[0]; p[1]=a_rot9[1]; p[2]=a_rot9[2];  p[3]=0.f;
 			p[4]=a_rot9[3]; p[5]=a_rot9[4]; p[6]=a_rot9[5];  p[7]=0.f;
 			p[8]=a_rot9[6]; p[9]=a_rot9[7]; p[10]=a_rot9[8]; p[11]=0.f;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+
+	// Restore 3-float translation to NiTransform (at a_off+0x30). No C++ objects – safe for __try (C2712).
+	__declspec(noinline) static void RestoreBoneTranslationRaw(RE::NiAVObject* a_node, std::uintptr_t a_off, const float* a_trans3)
+	{
+		__try {
+			std::uint8_t* base = reinterpret_cast<std::uint8_t*>(a_node) + a_off;
+			constexpr std::uintptr_t kTranslateOffset = 0x30;
+			float* p = reinterpret_cast<float*>(base + kTranslateOffset);
+			p[0] = a_trans3[0];
+			p[1] = a_trans3[1];
+			p[2] = a_trans3[2];
 		} __except (EXCEPTION_EXECUTE_HANDLER) {}
 	}
 
@@ -1970,6 +1984,88 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		}
 	}
 
+	// Forward declaration: used by TryBuildJointMapAndCaptureState (defined before UnpackSoaTransforms implementation).
+	static void UnpackSoaTransforms(std::span<const ozz::math::SoaTransform> a_soa, std::vector<Animation::Transform>& a_out, size_t a_jointCount);
+
+	/// Build joint map and capture rest/game base for this actor's state. Called from LoadAndStartAnimation (saf play) so we don't defer to UpdateGraphs.
+	/// Returns true if built successfully; false if actor 3D not ready (UpdateGraphs will retry later). Caller must hold g_graphMutex for state.
+	static bool TryBuildJointMapAndCaptureState(RE::Actor* a_actor, ActorGraphState& state)
+	{
+		if (!a_actor || !state.skeleton || !state.generator)
+			return false;
+		if (!SafeBuildJointMap(a_actor, *state.skeleton, state.jointNodes))
+			return false;
+		size_t found = 0;
+		for (auto* node : state.jointNodes)
+			if (node) ++found;
+		if (found == 0)
+			return false;
+
+		state.jointMapBuilt = true;
+		state.cachedActor3DRoot = GetActor3DRootRaw(a_actor);
+		SAF_LOG_INFO("[ATTACH] BuildJointMap done for actor {:X} (found {}/{}), rest/game base capture", a_actor->GetFormID(), found, state.jointNodes.size());
+
+		if (state.skeleton && state.skeleton->data) {
+			if (auto* clipGen = dynamic_cast<Animation::ClipGenerator*>(state.generator.get())) {
+				static thread_local std::vector<ozz::math::SoaTransform> s_restSoaBuf;
+				clipGen->SampleAtRatio(0.f, s_restSoaBuf);
+				UnpackSoaTransforms(std::span<const ozz::math::SoaTransform>(s_restSoaBuf.data(), s_restSoaBuf.size()),
+					state.restTransforms, state.skeleton->jointNames.size());
+			} else {
+				auto restSoa = state.skeleton->data->joint_rest_poses();
+				UnpackSoaTransforms(restSoa, state.restTransforms, state.skeleton->jointNames.size());
+			}
+		}
+		if (!g_niTransformSearchDone.load(std::memory_order_acquire)) {
+			for (size_t si = 0; si < state.jointNodes.size(); ++si) {
+				if (state.jointNodes[si]) {
+					g_niTransformOffset.store(ProbeNiTransformOffset(state.jointNodes[si]), std::memory_order_release);
+					g_niTransformSearchDone.store(true, std::memory_order_release);
+					break;
+				}
+			}
+		}
+		const std::uintptr_t off = g_niTransformOffset.load(std::memory_order_acquire);
+		state.gameBaseRotations.resize(state.jointNodes.size());
+		state.gameBaseTranslations.resize(state.jointNodes.size());
+		for (size_t si = 0; si < state.jointNodes.size(); ++si) {
+			auto& arr = state.gameBaseRotations[si];
+			if (!state.jointNodes[si] || !ReadBoneRotation(state.jointNodes[si], off, arr.data()))
+				arr = {1,0,0, 0,1,0, 0,0,1};
+
+			// Capture original translation so face/mouth and other joints can fully return to their pre-animation pose on Stop.
+			auto& t = state.gameBaseTranslations[si];
+			Animation::Transform gamePose;
+			if (state.jointNodes[si] && ReadBoneFullTransform(state.jointNodes[si], off, gamePose)) {
+				t = { gamePose.translation.x, gamePose.translation.y, gamePose.translation.z };
+			} else {
+				t = { 0.0f, 0.0f, 0.0f };
+			}
+		}
+		if (g_useActorRestPose.load(std::memory_order_acquire)) {
+			state.actorRestTransforms.resize(state.jointNodes.size());
+			for (size_t si = 0; si < state.jointNodes.size(); ++si) {
+				Animation::Transform tr;
+				tr.rotation = {0,0,0,1};
+				tr.translation = {0,0,0};
+				tr.scale = 1.0f;
+				if (state.jointNodes[si] && ReadBoneFullTransform(state.jointNodes[si], off, tr))
+					state.actorRestTransforms[si] = tr;
+				else
+					state.actorRestTransforms[si] = tr;
+			}
+			if (!state.actorRestTransforms.empty() && state.actorRestTransforms.size() == state.restTransforms.size()
+				&& state.skeleton && state.skeleton->jointNames.size() == state.restTransforms.size()) {
+				for (size_t si = 0; si < state.restTransforms.size(); ++si) {
+					const char* jname = state.skeleton->jointNames[si].c_str();
+					if (!IsSpineOrLegJoint(jname)) continue;
+					state.restTransforms[si].rotation = state.actorRestTransforms[si].rotation;
+				}
+			}
+		}
+		return true;
+	}
+
 	/// Call UpdateWorldData on root; if a_modifiedBones is non-empty and UseUpdateTransformAndBounds is true,
 	/// call UpdateTransformAndBounds on each modified bone (never on root) so the renderer sees animation without the character disappearing.
 	static void SafeUpdateWorldData(RE::Actor* a_actor, RE::NiAVObject* a_actorRoot, const std::vector<RE::NiAVObject*>* a_modifiedBones)
@@ -2103,6 +2199,16 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		}
 	}
 	const bool isMainThread = (g_mainThreadId != 0 && curThread == g_mainThreadId);
+
+	// F2 = open console (Better Console) when Input Hook is disabled; when enabled, Input.cpp handles F2
+	{
+		static bool s_f2WasDown = false;
+		const bool f2Down = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+		if (isMainThread && f2Down && !s_f2WasDown) {
+			Tasks::Input::SimulateOpenConsoleKey();
+		}
+		s_f2WasDown = f2Down;
+	}
 
 	if (requested || hasPending) {
 		if (callNum <= 10 || callNum % 60 == 0) {
@@ -3039,19 +3145,16 @@ static bool InstallAnimGraphManagerCallHook()
 			if (auto* cg = gen.get()) cg->SetLooping(a_looping);
 			SAF_LOG_INFO("LoadAndStartAnimation: ClipGenerator created");
 			AttachGenerator(a_actor, std::move(gen), 0.0f);
-			// Store which joints are actually animated by this clip (so we can skip defaults on face bones etc.).
+			// Store which joints are animated by this clip; build joint map here (saf play) so UpdateGraphs doesn't have to.
 			{
 				std::lock_guard<std::mutex> lock(g_graphMutex);
 				auto it = g_actorGraphs.find(a_actor->GetFormID());
 				if (it != g_actorGraphs.end()) {
 					it->second.jointHasChannel = rawAnim->jointHasChannel;
-				}
-			}
-			{
-				std::lock_guard<std::mutex> lock(g_graphMutex);
-				auto it = g_actorGraphs.find(a_actor->GetFormID());
-				if (it != g_actorGraphs.end())
 					it->second.currentAnimationPath = std::string(a_path);
+					if (!it->second.jointMapBuilt)
+						TryBuildJointMapAndCaptureState(a_actor, it->second);
+				}
 			}
 			SAF_LOG_INFO("LoadAndStartAnimation: generator attached");
 			return true;
@@ -3088,8 +3191,12 @@ static bool InstallAnimGraphManagerCallHook()
 				if (!node) continue;
 				const float* b = state.gameBaseRotations[i].data();
 				RestoreBoneRotationRaw(node, off, b);
+				if (i < state.gameBaseTranslations.size()) {
+					const float* t = state.gameBaseTranslations[i].data();
+					RestoreBoneTranslationRaw(node, off, t);
+				}
 			}
-			SAF_LOG_INFO("DetachGenerator: bone rotations restored for actor {:X}", id);
+			SAF_LOG_INFO("DetachGenerator: bone transforms restored for actor {:X}", id);
 		}
 
 		g_actorGraphs.erase(it);
@@ -3436,7 +3543,7 @@ bool GraphManager::ShouldDeferHookInstall() const
 			if (g_actorGraphs.empty()) {
 				static std::atomic<uint32_t> emptyGraphCount{ 0 };
 				uint32_t c = ++emptyGraphCount;
-				if (c <= 5 || c % 120 == 0) {
+				if (c <= 5 || c % 600 == 0) {
 					SAF_LOG_INFO("[UPDATE] UpdateGraphs: no active graphs");
 				}
 				return;
@@ -3444,6 +3551,9 @@ bool GraphManager::ShouldDeferHookInstall() const
 
 			static std::atomic<uint32_t> updateCount{ 0 };
 			const uint32_t ucount = ++updateCount;
+			// At most one BuildJointMap per frame to avoid 5–6 second freezes when several actors need setup
+			int jointMapsBuiltThisFrame = 0;
+			constexpr int kMaxJointMapBuildsPerFrame = 1;
 
 			for (auto& kv : g_actorGraphs) {
 			const auto id = kv.first;
@@ -3461,6 +3571,9 @@ bool GraphManager::ShouldDeferHookInstall() const
 			}
 
 			if (!state.jointMapBuilt && !state.jointMapBuildFailed) {
+				if (jointMapsBuiltThisFrame >= kMaxJointMapBuildsPerFrame) {
+					continue;  // defer to next frame so we don't freeze for seconds
+				}
 				actor = RE::TESForm::LookupByID<RE::Actor>(id);
 				if (!actor && id == 0x14) {
 					actor = RE::PlayerCharacter::GetSingleton();
@@ -3471,8 +3584,9 @@ bool GraphManager::ShouldDeferHookInstall() const
 						SAF_LOG_WARN("[UPDATE] UpdateGraphs: actor not found for id={}, will retry", id);
 					}
 				} else {
-					SAF_LOG_INFO("[UPDATE] UpdateGraphs: building joint map for actor={}", id);
+					SAF_LOG_INFO("[UPDATE] UpdateGraphs: building joint map for actor={} (1 per frame limit)", id);
 					const bool ok = SafeBuildJointMap(actor, *state.skeleton, state.jointNodes);
+					jointMapsBuiltThisFrame++;
 					if (!ok) {
 						state.jointMapBuildFailed = true;  // loadedData AV, stop retrying this actor
 					} else {
@@ -3615,7 +3729,7 @@ bool GraphManager::ShouldDeferHookInstall() const
 				}
 			}
 
-			if (ucount <= 5 || ucount % 120 == 0) {
+			if (ucount <= 5 || ucount % 600 == 0) {
 				SAF_LOG_INFO("[UPDATE] UpdateGraphs: actor={}, joints={}, dt={}",
 					id, state.skeleton->jointNames.size(), a_deltaSeconds);
 			}

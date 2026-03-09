@@ -6,12 +6,22 @@ Struct SequencePhase
     String filePath
 EndStruct
 
-Function PlayAnimation(Actor akTarget, String asAnim, Float fTransitionSeconds = 1.0) Global
-    SAFScript.PlayOnActor(akTarget, asAnim)
+Function PlayAnimation(Actor akTarget, String asAnim, Float fSpeed = 1.0) Global
+    SAFScript.PlayOnActor(akTarget, asAnim, fSpeed)
 EndFunction
 
-Function PlayAnimationOnce(Actor akTarget, String asAnim, Float fTransitionSeconds = 1.0) Global
-    SAFScript.PlayOnActor(akTarget, asAnim)
+Function PlayAnimationOnce(Actor akTarget, String asAnim, Float fSpeed = 1.0) Global
+    SAFScript.PlayOnActor(akTarget, asAnim, fSpeed)
+EndFunction
+
+Function PlayOnTargetOrPlayer(String asAnim, Float fSpeed = 1.0) Global
+    Actor target = Game.GetCrosshairRef()
+    If target == None
+        target = Game.GetPlayer()
+    EndIf
+    If target != None
+        SAFScript.PlayOnActor(target, asAnim, fSpeed)
+    EndIf
 EndFunction
 
 Bool Function StopAnimation(Actor akTarget, Float fTransitionSeconds = 1.0) Global

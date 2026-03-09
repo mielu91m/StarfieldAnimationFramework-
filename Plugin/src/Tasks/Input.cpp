@@ -45,6 +45,18 @@ namespace Tasks
 		FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(from), 14);
 	}
 
+	void Input::SimulateOpenConsoleKey()
+	{
+		INPUT inputs[2] = {};
+		inputs[0].type = INPUT_KEYBOARD;
+		inputs[0].ki.wVk = static_cast<WORD>(VK_OEM_3);
+		inputs[0].ki.dwFlags = 0;
+		inputs[1].type = INPUT_KEYBOARD;
+		inputs[1].ki.wVk = static_cast<WORD>(VK_OEM_3);
+		inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+		SendInput(2, inputs, sizeof(INPUT));
+	}
+
 	static void PerformInputProcessingHookImpl(const RE::PlayerCamera* a_camera, const RE::InputEvent* a_queueHead)
 	{
 		// Run game input processing FIRST so activation (E), docking, menus etc. respond immediately.

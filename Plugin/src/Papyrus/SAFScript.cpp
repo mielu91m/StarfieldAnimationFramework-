@@ -51,7 +51,7 @@ namespace Papyrus::SAFScript
 			return resolved;
 		}
 
-		bool PlayOnActorImpl(RE::Actor* a_actor, std::string_view a_animId, int a_animIndex = 0)
+		bool PlayOnActorImpl(RE::Actor* a_actor, std::string_view a_animId, float a_speed = 1.0f, int a_animIndex = 0)
 		{
 			if (!a_actor) {
 				SAF_LOG_WARN("[Papyrus] PlayOnActorImpl: actor is null");
@@ -69,9 +69,16 @@ namespace Papyrus::SAFScript
 			std::string pathStr = resolvedPath.string();
 
 			try {
-				SAF_LOG_INFO("[Papyrus] PlayOnActorImpl: playing '{}' index {} on actor {:08X}", pathStr, a_animIndex, a_actor->GetFormID());
+				if (a_speed <= 0.0f) {
+					a_speed = 1.0f;
+				}
+				SAF_LOG_INFO("[Papyrus] PlayOnActorImpl: playing '{}' index {} on actor {:08X} (speed={})", pathStr, a_animIndex, a_actor->GetFormID(), a_speed);
 				bool ok = mgr->LoadAndStartAnimation(a_actor, pathStr, true, a_animIndex);
 				if (ok) mgr->RequestGraphUpdate();
+				// Apply initial speed override after graph is created.
+				if (ok) {
+					mgr->SetAnimationSpeed(a_actor, a_speed);
+				}
 				return ok;
 			} catch (const std::exception& e) {
 				SAF_LOG_ERROR("[Papyrus] PlayOnActorImpl: exception '{}'", e.what());
@@ -152,13 +159,14 @@ namespace Papyrus::SAFScript
 		Papyrus::EventManager::GetSingleton()->UnregisterScript(Papyrus::EventType::kSequenceEnd, handle);
 	}
 
-	// Papyrus: SAFScript.PlayOnActor(Actor akActor, string animId, int animIndex=0) -> bool
+	// Papyrus: SAFScript.PlayOnActor(Actor akActor, string animId, float speed=1.0, int animIndex=0) -> bool
 	bool PlayOnActor(
 		RE::BSScript::IVirtualMachine& /*a_vm*/,
 		std::uint32_t /*a_stackID*/,
 		RE::BSScript::Object& /*a_script*/,
 		RE::Actor* a_actor,
 		RE::BSFixedString a_animId,
+		float a_speed,
 		int a_animIndex)
 	{
 		if (!a_actor) {
@@ -169,15 +177,16 @@ namespace Papyrus::SAFScript
 			SAF_LOG_WARN("[Papyrus] PlayOnActor: animId is empty");
 			return false;
 		}
-		return PlayOnActorImpl(a_actor, a_animId.c_str(), a_animIndex >= 0 ? a_animIndex : 0);
+		return PlayOnActorImpl(a_actor, a_animId.c_str(), a_speed, a_animIndex >= 0 ? a_animIndex : 0);
 	}
 
-	// Papyrus: SAFScript.PlayOnPlayer(string animId, int animIndex=0) -> bool
+	// Papyrus: SAFScript.PlayOnPlayer(string animId, float speed=1.0, int animIndex=0) -> bool
 	bool PlayOnPlayer(
 		RE::BSScript::IVirtualMachine& /*a_vm*/,
 		std::uint32_t /*a_stackID*/,
 		RE::BSScript::Object& /*a_script*/,
 		RE::BSFixedString a_animId,
+		float a_speed,
 		int a_animIndex)
 	{
 		if (!a_animId.data()) {
@@ -191,7 +200,7 @@ namespace Papyrus::SAFScript
 			return false;
 		}
 
-		return PlayOnActorImpl(player, a_animId.c_str(), a_animIndex >= 0 ? a_animIndex : 0);
+		return PlayOnActorImpl(player, a_animId.c_str(), a_speed, a_animIndex >= 0 ? a_animIndex : 0);
 	}
 
 	// Papyrus: SAFScript.PlayOnActors(Actor[] akActors, string animId, int animIndex=0) -> bool

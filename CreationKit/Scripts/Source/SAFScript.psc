@@ -1,7 +1,7 @@
 Scriptname SAFScript extends ScriptObject Native
 
-Bool Function PlayOnActor(Actor akActor, String animId) Native Global
-Bool Function PlayOnPlayer(String animId) Native Global
+Bool Function PlayOnActor(Actor akActor, String animId, Float fSpeed = 1.0, Int animIndex = 0) Native Global
+Bool Function PlayOnPlayer(String animId, Float fSpeed = 1.0, Int animIndex = 0) Native Global
 Bool Function StopAnimation(Actor akActor) Native Global
 
 String Function GetCurrentAnimation(Actor akActor) Native Global

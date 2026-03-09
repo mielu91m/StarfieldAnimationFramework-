@@ -25,7 +25,9 @@ namespace Tasks
 
 		static Input* GetSingleton();
 		static bool InstallHook();
-		
+		/// Simulates the tilde (`) key so the game/Better Console opens. Call when F2 is pressed for "open companion" behaviour.
+		static void SimulateOpenConsoleKey();
+
 		void RegisterForKey(BS_BUTTON_CODE a_key, InputCallback* a_callback);
 		void RegisterForKey(BS_BUTTON_CODE a_key, ButtonCallback a_callback);
 
