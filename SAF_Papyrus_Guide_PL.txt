@@ -126,7 +126,7 @@
   Jeśli tej linii NIE MA – wywołanie nie dociera do SAF. Sprawdź:
     • Czy Import SAF jest poprawny (wielkie litery)
     • Czy używasz SAF.PlayAnimation (nie saf.PlayAnimation)
-    • Czy GergelEbanexQuestScript.pex (lub inny skrypt) jest skompilowany po zmianach
+    • Czy TwójScript.pex (lub inny skrypt) jest skompilowany po zmianach
     • Czy SAF.pex i SAFScript.pex są w Data\Scripts\
 
 
