@@ -839,7 +839,14 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		std::string currentAnimationPath;
 		float playbackSpeed = 1.0f;
 		bool positionLocked = false;
+		// Światowa pozycja i orientacja, w którą chcemy „zakotwiczyć” aktora, gdy positionLocked = true.
+		// Wzorzec z algorytmu Ebanexa:
+		// 1) SetPosition/SetAngle (NPC) / Game.PopPlayerTo (player)
+		// 2) SAF.PlayAnimation
+		// 3) SAF.SetActorPosition (te same współrzędne)
+		// 4) SAF.SetPositionLocked
 		float positionX = 0.0f, positionY = 0.0f, positionZ = 0.0f;
+		float angleX = 0.0f, angleY = 0.0f, angleZ = 0.0f;
 		std::unordered_map<std::string, float> blendGraphVariables;
 	};
 
@@ -3383,7 +3390,18 @@ static bool InstallAnimGraphManagerCallHook()
 		std::lock_guard<std::mutex> lock(g_graphMutex);
 		auto it = g_actorGraphs.find(a_actor->GetFormID());
 		if (it != g_actorGraphs.end()) {
-			it->second.positionX = a_x; it->second.positionY = a_y; it->second.positionZ = a_z;
+			auto& state = it->second;
+			state.positionX = a_x;
+			state.positionY = a_y;
+			state.positionZ = a_z;
+
+			// Dodatkowo zapamiętujemy aktualny kąt aktora.
+			// Dzięki temu przy włączonym positionLocked blokujemy nie tylko przesuwanie,
+			// ale i obrót – tak jak w NAF (NPC nie „walczy” z pakietem AI).
+			const RE::NiPoint3 ang = a_actor->GetAngle();
+			state.angleX = ang.x;
+			state.angleY = ang.y;
+			state.angleZ = ang.z;
 		}
 	}
 
@@ -3915,6 +3933,9 @@ bool GraphManager::ShouldDeferHookInstall() const
 
 			if (actor) {
 				if (state.positionLocked) {
+					// „Twarde kotwienie” pozycji w świecie – po każdej klatce
+					// przywracamy aktora do zadanych współrzędnych.
+					// (Obrót nadal kontroluje silnik; brak publicznego SetAngle())
 					RE::NiPoint3 pos(state.positionX, state.positionY, state.positionZ);
 					actor->SetPosition(pos, false);
 				} else {

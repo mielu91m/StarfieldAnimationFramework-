@@ -71,6 +71,23 @@
   Info:
     String Function GetCurrentAnimation(Actor akActor)      native global
 
+  High‑level helpers for locking an actor (position + AI/movement):
+    Function LockActorForAnimation(Actor akActor, Float fX, Float fY, Float fZ,
+                                   Bool abIsPlayer = false) Global
+    Function UnlockActorAfterAnimation(Actor akActor,
+                                       Bool abIsPlayer = false) Global
+
+  Recommended usage pattern (Ebanex algorithm):
+    1) Compute shared scene coordinates (root of all models).
+    2) For the player:
+         SAFScript.LockActorForAnimation(Game.GetPlayer(), x, y, z, true)
+       For an NPC:
+         SAFScript.LockActorForAnimation(akNpc, x, y, z, false)
+    3) Start animations via PlayOnActor/PlayOnPlayer.
+    4) When the scene ends:
+         SAFScript.UnlockActorAfterAnimation(Game.GetPlayer(), true)
+         SAFScript.UnlockActorAfterAnimation(akNpc, false)
+
 
 6. `SAF` WRAPPER (NAF‑STYLE)
 --------------------------------------------------------------------------------
