@@ -1,5 +1,5 @@
 ================================================================================
-  SAF – Poradnik tworzenia moda kompatybilnego z Papyrusem
+  SAF – Poradnik Papyrusa dla twórców modów
   Starfield Animation Framework – odtwarzanie animacji przez skrypty
 ================================================================================
 
@@ -7,162 +7,186 @@
 --------------------------------------------------------------------------------
   • Starfield (aktualna wersja)
   • SFSE (Starfield Script Extender)
-  • MCF (Modern Command Framework)
   • Address Library for Starfield
   • StarfieldAnimationFramework (SAF) – plugin + skrypty
 
-  Twój mod musi mieć w zależnościach: SAF, MCF, Address Library.
 
-
-2. INSTALACJA PLIKÓW SAF (dla twórcy moda)
+2. CO DOŁĄCZYĆ DO MODA
 --------------------------------------------------------------------------------
-  Skopiuj do swojego moda:
+  Typowy mod, który używa SAF, powinien zawierać:
 
-  • StarfieldAnimationFramework.dll  →  Data\SFSE\Plugins\
-  • SAF.pex, SAFScript.pex           →  Data\Scripts\
-  • SAF.psc, SAFScript.pex           →  Data\Scripts\Source\
+  • StarfieldAnimationFramework.dll      →  Data\SFSE\Plugins\
+  • SAF.pex, SAFScript.pex               →  Data\Scripts\
+  • (opcjonalnie) SAF.psc, SAFScript.psc →  Data\Scripts\Source\  – dla innych modderów
 
-  (Opcjonalnie: Game.psc – stub do kompilacji, jeśli używasz PlayOnTargetOrPlayer)
+  Pliki animacji (.glb / .gltf) umieszczaj w:
+      Data\SAF\Animations\
 
-  Animacje (.glb, .gltf) umieść w:  Data\SAF\Animations\
+
+3. DWA POZIOMY API: SAF vs SAFScript
+--------------------------------------------------------------------------------
+  • `SAFScript`  – bezpośrednie funkcje natywne (Native Global) z pluginu.
+                    Pełna kontrola: prędkość, indeks animacji, sekwencje, eventy.
+  • `SAF`        – prosty wrapper w stylu NAF (wygodny przy portowaniu starych modów).
+
+  NOWE MODY: zalecane jest używanie `SAFScript` tam, gdzie chcesz mieć
+  dokładną kontrolę nad prędkością i indeksem animacji, a `SAF` tylko jako cienki
+  wrapper tam, gdzie chcesz zachować kompatybilne nazwy funkcji.
 
 
-3. IMPORT W SKRYPCIE PAPYRUSA
+4. IMPORT W SKRYPCIE PAPYRUSA
 --------------------------------------------------------------------------------
   Na początku skryptu (po Scriptname, przed Properties) dodaj:
 
-    Import SAF
+    Import SAFScript
+    ; opcjonalnie:
+    ; Import SAF
 
-  UWAGA: Litera „S”, „A”, „F” musi być WIELKA – Papyrus rozróżnia wielkość liter.
-  Błędne:  import saf   →  nie zadziała
-  Poprawne: Import SAF  →  działa
+  UWAGA: Papyrus rozróżnia wielkość liter.
+    ❌ import safscript
+    ✅ Import SAFScript
 
 
-4. PODSTAWOWE FUNKCJE API
+5. PODSTAWOWE FUNKCJE `SAFScript`
 --------------------------------------------------------------------------------
+  Odtwarzanie animacji:
+    Bool Function PlayOnActor(Actor akActor, String animId,
+                              Float fSpeed = 1.0, Int animIndex = 0) native global
 
-  Odtwarzanie animacji na konkretnym aktorze:
-  ------------------------------------------
-    SAF.PlayAnimation(Actor akTarget, String asAnim, Float fSpeed = 1.0)
+    Bool Function PlayOnPlayer(String animId,
+                               Float fSpeed = 1.0, Int animIndex = 0) native global
 
-    Przykład:
-      SAF.PlayAnimation(Game.GetPlayer(), "test", 1.0)
-      SAF.PlayAnimation(akNPC, "GE\\scena1.glb", 0.5)
-
-    • akTarget – aktor, na którym odtwarzana jest animacja
-    • asAnim   – nazwa pliku animacji (np. "test", "test.glb", "folder\\anim.glb")
-    • fSpeed   – prędkość odtwarzania (1.0 = normalna, 2.0 = 2× szybciej, 0.5 = wolniej)
-
-
-  Odtwarzanie na celowniku lub graczu (jak w konsoli „saf play”):
-  ----------------------------------------------------------------
-    SAF.PlayOnTargetOrPlayer(String asAnim, Float fSpeed = 1.0)
-
-    Jeśli celownik jest na NPC – animacja na tym NPC.
-    Jeśli nie – animacja na graczu.
-
-    Przykład:
-      SAF.PlayOnTargetOrPlayer("test", 1.0)
-
-
-  Odtwarzanie bez pętli (jednorazowo):
-  ------------------------------------
-    SAF.PlayAnimationOnce(Actor akTarget, String asAnim, Float fSpeed = 1.0)
-
+  • `akActor`   – aktor, na którym ma grać animacja.
+  • `animId`    – identyfikator animacji, ten sam, którego używasz w konsoli
+                  przy komendzie `saf play` (np. "test", "bw", "GE\\scena1.glb").
+  • `fSpeed`    – prędkość odtwarzania (w SAF **1.0 = normalnie**, 2.0 = 2× szybciej).
+  • `animIndex` – indeks animacji w pliku (0 = pierwsza, 1 = druga itd.).
 
   Zatrzymanie animacji:
-  ---------------------
-    SAF.StopAnimation(Actor akTarget)
+    Bool Function StopAnimation(Actor akActor) native global
 
-
-  Synchronizacja wielu aktorów (ta sama animacja):
-  ------------------------------------------------
-    SAF.SyncAnimations(Actor[] akTargets)
-    SAF.StopSyncing(Actor akTarget)
-
-
-  Prędkość i pozycja:
-  -------------------
-    SAF.SetAnimationSpeed(Actor akTarget, Float fSpeed)
-    SAF.GetAnimationSpeed(Actor akTarget)
-    SAF.SetPositionLocked(Actor akTarget, Bool bLocked)
-    SAF.SetActorPosition(Actor akTarget, Float fX, Float fY, Float fZ)
-
+  Prędkość animacji:
+    Function SetAnimationSpeed(Actor akActor, Float fSpeed) native global
+    Float   Function GetAnimationSpeed(Actor akActor) native global
 
   Informacje:
-  -----------
-    SAF.GetCurrentAnimation(Actor akTarget)  →  zwraca ścieżkę aktualnej animacji
+    String Function GetCurrentAnimation(Actor akActor) native global
 
 
-5. NAZWA ANIMACJI (asAnim)
+6. WRAPPER `SAF` (kompatybilny z NAF)
 --------------------------------------------------------------------------------
-  Używaj dokładnie tej samej nazwy, która działa w konsoli przy „saf play”.
+  Jeśli chcesz zachować NAF‑owe nazwy funkcji, możesz użyć:
 
-  • "test"        – szuka test.glb / test.gltf w Data\SAF\Animations\
-  • "test.glb"    – to samo
-  • "GE\\scena1"  – ścieżka względna w folderze animacji (np. GE\scena1.glb)
+    Import SAF
+
+    ; NAF‑style API – wewnętrznie woła SAFScript.PlayOnActor(...)
+    Function PlayAnimation(Actor akTarget, String asAnim,
+                           Float fTransitionSeconds = 1.0) Global
+
+    Function PlayAnimationOnce(Actor akTarget, String asAnim,
+                               Float fTransitionSeconds = 1.0) Global
+
+  W aktualnej wersji SAF:
+  • parametr `fTransitionSeconds` jest zachowany tylko dla kompatybilności (docelowo
+    będzie kontrolował czas przejścia między fazami),
+  • prędkość animacji jest stała (1.0); do zmiany prędkości używaj:
+
+      Bool Function SetAnimationSpeed(Actor akTarget, Float fSpeed) Global
+      Float Function GetAnimationSpeed(Actor akTarget) Global
+
+    gdzie w wrapperze **100.0 = normalna prędkość** (jak w NAF), a wewnętrznie
+    jest to przeliczane na 1.0 w `SAFScript`.
 
 
-6. CZĘSTE BŁĘDY
+7. UŻYCIE Z KONKRETNYM AKTOREM (PRAKTYCZNY PRZYKŁAD)
 --------------------------------------------------------------------------------
-  ❌ import saf                    →  wielkość liter ma znaczenie
-  ✅ Import SAF
+  Przykład prostego skryptu questowego:
 
-  ❌ saf.PlayAnimation(...)        →  „saf” to zmienna, nie typ
-  ✅ SAF.PlayAnimation(...)        →  wywołanie na typie SAF
+    Scriptname MyQuestSAFScript extends Quest
 
-  ❌ Brak SAF.pex / SAFScript.pex w Data\Scripts\  →  gra nie znajdzie API
-  ✅ Upewnij się, że oba .pex są w paczce moda
+    Import SAFScript
+
+    Actor Property Target Auto
+
+    Function PlayIdle()
+        ; zagra animację "bw" z normalną prędkością na aktorze Target
+        Bool ok = SAFScript.PlayOnActor(Target, "bw", 1.0, 0)
+        If ok
+            Debug.Notification("SAF: animacja wystartowała")
+        Else
+            Debug.Notification("SAF: nie udało się uruchomić animacji")
+        EndIf
+    EndFunction
 
 
-7. TESTOWANIE I DEBUGOWANIE
+8. WYWOŁANIA Z KONSOLI (TESTOWANIE)
+--------------------------------------------------------------------------------
+  Konsola NIE rozumie wyrażeń w stylu:
+      SAF.PlayAnimation(14, "bw", 1.0)
+
+  Do wywoływania funkcji globalnych używaj komendy `cgf`:
+
+    cgf "SAFScript.Ping"
+    cgf "SAFScript.PlayOnActor" 14 "bw" 1.0 0
+
+  Jeśli używasz wrappera `SAF`:
+
+    cgf "SAF.PlayAnimation" 14 "bw" 1.0
+
+  • `14` – przykład: formID / referencja aktora (tak jak przy innych `cgf`).
+
+
+9. NAZWA ANIMACJI (animId / asAnim)
+--------------------------------------------------------------------------------
+  Używaj dokładnie tej samej nazwy, która działa w konsoli przy komendzie:
+      saf play <actorRef> <animId> [index]
+
+  Typowe przykłady:
+  • "test"        – szuka `test.glb` / `test.gltf` w Data\SAF\Animations\
+  • "test.glb"    – to samo, pełna nazwa pliku
+  • "GE\\scena1"  – ścieżka względna w folderze animacji (np. `GE\scena1.glb`)
+
+
+10. TESTOWANIE I DEBUGOWANIE
 --------------------------------------------------------------------------------
   Log SAF:
     Documents\My Games\Starfield\SFSE\Logs\StarfieldAnimationFramework.log
 
-  Po wywołaniu SAF.PlayAnimation(...) w logu powinna pojawić się linia:
+  Po wywołaniu `SAFScript.PlayOnActor(...)` lub `SAF.PlayAnimation(...)` w logu
+  powinna pojawić się linia w stylu:
     [Papyrus] PlayOnActorImpl: playing '...' index ... on actor ...
 
-  Jeśli tej linii NIE MA – wywołanie nie dociera do SAF. Sprawdź:
-    • Czy Import SAF jest poprawny (wielkie litery)
-    • Czy używasz SAF.PlayAnimation (nie saf.PlayAnimation)
-    • Czy TwójScript.pex (lub inny skrypt) jest skompilowany po zmianach
-    • Czy SAF.pex i SAFScript.pex są w Data\Scripts\
+  Jeśli tej linii NIE MA:
+    • sprawdź, czy Import SAFScript / Import SAF są poprawne (wielkie litery),
+    • upewnij się, że Twój skrypt został ponownie skompilowany do .pex,
+    • sprawdź, czy w Data\Scripts\ są aktualne pliki SAF.pex i SAFScript.pex,
+    • upewnij się, że plugin StarfieldAnimationFramework.dll jest w Data\SFSE\Plugins\.
 
 
-  Prosty test – dodaj przed wywołaniem:
-    Debug.Notification("Wywołuję SAF.PlayAnimation")
-    SAF.PlayAnimation(akActor, "test", 1.0)
-
-  Jeśli notyfikacja się pojawia, ale w logu SAF nadal brak [Papyrus] – 
-  gra prawdopodobnie ładuje stare lub inne wersje SAF.pex/SAFScript.pex.
-
-
-8. SEKWENCJE I ZDARZENIA (zaawansowane)
+11. SEKWENCJE I ZDARZENIA (tylko SAFScript)
 --------------------------------------------------------------------------------
-  SAF.StartSequence(Actor akTarget, SequencePhase[] sPhases, Bool bLoop)
-  SAF.AdvanceSequence(Actor akTarget, Bool bSmooth)
-  SAF.GetSequencePhase(Actor akTarget)
-  SAF.SetSequencePhase(Actor akTarget, Int iPhase)
+  Sekwencje animacji:
+    Function StartSequence(Actor akActor, String[] asPaths, Bool bLoop) native global
+    Bool     Function AdvanceSequence(Actor akActor, Bool bSmooth)     native global
+    Int      Function GetSequencePhase(Actor akActor)                  native global
+    Bool     Function SetSequencePhase(Actor akActor, Int iPhase)      native global
 
   Rejestracja zdarzeń:
-    SAF.RegisterForPhaseBegin(ScriptObject sScript, String sFunctionName)
-    SAF.RegisterForSequenceEnd(ScriptObject sScript, String sFunctionName)
-    SAF.UnregisterForPhaseBegin(ScriptObject sScript)
-    SAF.UnregisterForSequenceEnd(ScriptObject sScript)
+    Function RegisterForPhaseBegin(ScriptObject akScript, String asFunctionName)   native global
+    Function RegisterForSequenceEnd(ScriptObject akScript, String asFunctionName)  native global
+    Function UnregisterForPhaseBegin(ScriptObject akScript)                        native global
+    Function UnregisterForSequenceEnd(ScriptObject akScript)                       native global
 
 
-9. NATYWNE API (SAFScript) – dla zaawansowanych
+12. SYNCHRONIZACJA I ZMIENNE BLENDU
 --------------------------------------------------------------------------------
-  Możesz też używać bezpośrednio:
+  Synchronizacja wielu aktorów:
+    Function SyncGraphs(Actor[] akTargets) native global
+    Function StopSyncing(Actor akTarget)   native global
 
-    Import SAFScript
-
-    SAFScript.PlayOnActor(Actor akActor, String animId, Float fSpeed = 1.0, Int animIndex = 0)
-    SAFScript.PlayOnPlayer(String animId, Float fSpeed = 1.0, Int animIndex = 0)
-    SAFScript.PlayOnActors(Actor[] akActors, String animId, Int animIndex = 0)
-
-  animIndex – indeks animacji w pliku (0 = pierwsza, 1 = druga itd.)
+  Zmienne blend graphu:
+    Bool  Function SetBlendGraphVariable(Actor akActor, String asName, Float fValue) native global
+    Float Function GetBlendGraphVariable(Actor akActor, String asName)               native global
 
 
 ================================================================================
