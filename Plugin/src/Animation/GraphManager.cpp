@@ -127,6 +127,8 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 	static std::atomic<bool> g_animateFaceJoints{ true };  // default on: face bones animated with blend so they don't disappear
 	// Siła miksu twarzy: 0.0 = tylko gra, 1.0 = tylko animacja, wartości pośrednie = blend.
 	static std::atomic<float> g_faceAnimStrength{ 0.5f };  // 0.5 = 50% anim / 50% game for face rotation
+	// Prędkość odtwarzania animacji w saf playscene (1.0 = domyślna, 2.0 = dwukrotnie szybciej).
+	static std::atomic<float> g_playSceneSpeed{ 1.0f };
 	// 0 = off, 1..4 = prosta poprawka osi dla kręgosłupa i nóg (Spine/Legs) po wyliczeniu macierzy:
 	// 1: R*Rx(+90°), 2: R*Rx(-90°), 3: R*Ry(+90°), 4: R*Ry(-90°).
 	static std::atomic<int> g_spineLegsSimpleAxisFix{ 0 };
@@ -319,6 +321,16 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 				SAF_LOG_INFO("FaceAnimationStrength: {}", v);
 			} catch (...) {
 				SAF_LOG_WARN("FaceAnimationStrength invalid in ini: {}", value);
+			}
+		} else if (key == "PlaySceneSpeed") {
+			try {
+				float v = std::stof(std::string(Trim(value)));
+				if (v < 0.1f) v = 0.1f;
+				if (v > 10.0f) v = 10.0f;
+				g_playSceneSpeed.store(v, std::memory_order_release);
+				SAF_LOG_INFO("PlaySceneSpeed: {} (1.0=default, 2.0=twice as fast for saf playscene)", v);
+			} catch (...) {
+				SAF_LOG_WARN("PlaySceneSpeed invalid in ini: {}", value);
 			}
 		} else if (key == "ApplyYUpToZUpConversion") {
 			const bool enabled = ParseBool(value, true);
@@ -3357,6 +3369,12 @@ static bool InstallAnimGraphManagerCallHook()
 		std::lock_guard<std::mutex> lock(g_graphMutex);
 		auto it = g_actorGraphs.find(a_actor->GetFormID());
 		return it != g_actorGraphs.end() ? it->second.playbackSpeed : 0.0f;
+	}
+
+	float GraphManager::GetPlaySceneSpeed()
+	{
+		LoadHookOverrideFromIni();
+		return g_playSceneSpeed.load(std::memory_order_acquire);
 	}
 
 	void GraphManager::SetActorPosition(RE::Actor* a_actor, float a_x, float a_y, float a_z)

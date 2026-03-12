@@ -42,7 +42,9 @@ namespace Animation
 		void StopSyncing(RE::Actor* a_actor);
 		void AdvanceSequence(RE::Actor* a_actor, bool a_smooth);
 		void SetGraphControlsPosition(RE::Actor* a_actor, bool a_lock);
-		
+		/// Prędkość odtwarzania w saf playscene (z INI PlaySceneSpeed). 1.0 = domyślna.
+		static float GetPlaySceneSpeed();
+
 		template <typename T, typename U>
 		void RegisterForEvent(U* a_listener)
 		{

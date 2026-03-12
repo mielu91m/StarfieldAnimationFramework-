@@ -1,27 +1,22 @@
 Scriptname SAF extends ScriptObject
 
 Struct SequencePhase
+    ; If set to -1, will loop infinitely. If set to 0, indicates a play-once/non-looping animation.
     Int numLoops = 0
+    ; The amount of time to take to blend from the previous phase to this phase, in seconds. Does not affect phase timing, only visuals.
     Float transitionTime = 1.0
+    ; The path to the animation file, starting from the Starfield/Data/SAF folder (analogicznie do NAF).
     String filePath
 EndStruct
 
-Function PlayAnimation(Actor akTarget, String asAnim, Float fSpeed = 1.0) Global
-    SAFScript.PlayOnActor(akTarget, asAnim, fSpeed)
+; NAF-compatible API: fTransitionSeconds controls blend time in NAF.
+; W SAF na razie używamy domyślnego czasu przejścia, a prędkość animacji = 1.0 (normalna).
+Function PlayAnimation(Actor akTarget, String asAnim, Float fTransitionSeconds = 1.0) Global
+    SAFScript.PlayOnActor(akTarget, asAnim, 1.0)
 EndFunction
 
-Function PlayAnimationOnce(Actor akTarget, String asAnim, Float fSpeed = 1.0) Global
-    SAFScript.PlayOnActor(akTarget, asAnim, fSpeed)
-EndFunction
-
-Function PlayOnTargetOrPlayer(String asAnim, Float fSpeed = 1.0) Global
-    Actor target = Game.GetCrosshairRef()
-    If target == None
-        target = Game.GetPlayer()
-    EndIf
-    If target != None
-        SAFScript.PlayOnActor(target, asAnim, fSpeed)
-    EndIf
+Function PlayAnimationOnce(Actor akTarget, String asAnim, Float fTransitionSeconds = 1.0) Global
+    SAFScript.PlayOnActor(akTarget, asAnim, 1.0)
 EndFunction
 
 Bool Function StopAnimation(Actor akTarget, Float fTransitionSeconds = 1.0) Global
@@ -69,13 +64,14 @@ Function SetActorPosition(Actor akTarget, Float fX, Float fY, Float fZ) Global
     SAFScript.SetActorPosition(akTarget, fX, fY, fZ)
 EndFunction
 
+; W NAF 100.0 to normalna prędkość. W SAF 1.0 to normalna prędkość.
 Bool Function SetAnimationSpeed(Actor akTarget, Float fSpeed) Global
-    SAFScript.SetAnimationSpeed(akTarget, fSpeed)
+    SAFScript.SetAnimationSpeed(akTarget, fSpeed / 100.0)
     return true
 EndFunction
 
 Float Function GetAnimationSpeed(Actor akTarget) Global
-    return SAFScript.GetAnimationSpeed(akTarget)
+    return SAFScript.GetAnimationSpeed(akTarget) * 100.0
 EndFunction
 
 String Function GetCurrentAnimation(Actor akTarget) Global

@@ -66,6 +66,8 @@ namespace Commands::SAFCommand
 	static std::atomic<bool> g_aliasesInitialized{ false };
 	static std::atomic<bool> g_overridesLoaded{ false };
 
+	// (playscene soft lock removed – left only speed control)
+
 	static std::string NormalizeKey(std::string_view a_key)
 	{
 		return Util::String::ToLower(a_key);
@@ -416,6 +418,99 @@ namespace Commands::SAFCommand
 		});
 
 		SAF_LOG_INFO("[TASK] QueuePlayTask: DONE - task queued");
+	}
+
+	// Wykonaj komendę playscene na głównym wątku:
+	// saf playscene <refId1> <refId2> <file1> <file2> [speed]
+	// speed – opcjonalne, np. 1.0 (x1), 2.0 (x2). Gdy brak, używana jest wartość z INI (PlaySceneSpeed).
+	static void QueuePlaySceneTask(
+		std::string actorId1,
+		std::string actorId2,
+		std::string file1,
+		std::string file2,
+		std::optional<float> optSpeed)
+	{
+		SAF_LOG_INFO("[TASK] QueuePlaySceneTask: START - a1='{}', a2='{}', f1='{}', f2='{}', speedOverride={}",
+			actorId1, actorId2, file1, file2, optSpeed ? std::to_string(*optSpeed) : "INI");
+
+		const auto* taskInterface = SFSE::GetTaskInterface();
+		if (!taskInterface) {
+			SAF_LOG_ERROR("[TASK] QueuePlaySceneTask: SFSE TaskInterface not available");
+			return;
+		}
+
+		taskInterface->AddTask(
+			[actorId1 = std::move(actorId1),
+			 actorId2 = std::move(actorId2),
+			 file1 = std::move(file1),
+			 file2 = std::move(file2),
+			 optSpeed]() mutable {
+				std::stringstream ss;
+				ss << std::this_thread::get_id();
+				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: ENTRY (thread_id={})", ss.str());
+
+				RE::Actor* a1 = GetActorByRefID(actorId1);
+				RE::Actor* a2 = GetActorByRefID(actorId2);
+
+				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: a1Id='{}' -> {}", actorId1, static_cast<void*>(a1));
+				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: a2Id='{}' -> {}", actorId2, static_cast<void*>(a2));
+
+				if (!a1 || !a2) {
+					SAF_LOG_WARN("[TASK] ExecutePlaySceneTask: missing actor(s), aborting");
+					return;
+				}
+
+				auto* mgr = Animation::GraphManager::GetSingleton();
+				if (!mgr) {
+					SAF_LOG_ERROR("[TASK] ExecutePlaySceneTask: GraphManager null");
+					return;
+				}
+
+				// Alias/override -> klucz, potem rozwiąż ścieżkę jak w komendzie play
+				auto key1 = ResolveOverridePath(file1);
+				auto key2 = ResolveOverridePath(file2);
+
+				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: resolving paths '{}' / '{}'", key1, key2);
+				const auto path1 = ResolveAnimationPathWithFallback(key1);
+				const auto path2 = ResolveAnimationPathWithFallback(key2);
+				const std::string pathStr1 = path1.string();
+				const std::string pathStr2 = path2.string();
+				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: resolved paths '{}' / '{}'", pathStr1, pathStr2);
+
+				// Aktor 1 zostaje w miejscu. Aktor 2 dostaje pozycję aktora 1 – odtwarzają w jednym miejscu.
+				RE::NiPoint3 pos1 = a1->GetPosition();
+				a2->SetPosition(pos1, false);
+				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: a2 moved to a1 position ({}, {}, {})", pos1.x, pos1.y, pos1.z);
+
+				try {
+					bool ok1 = mgr->LoadAndStartAnimation(a1, pathStr1, true, 0);
+					bool ok2 = mgr->LoadAndStartAnimation(a2, pathStr2, true, 0);
+					SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: LoadAndStartAnimation a1={} a2={} (ok1={}, ok2={})",
+						static_cast<void*>(a1), static_cast<void*>(a2), ok1, ok2);
+
+					// Nie blokujemy pozycji (SetGraphControlsPosition/SetActorPosition) – powodowało to crash w UpdateGraphs.
+					// Aktor 2 jest już ustawiony na pozycję aktora 1 wyżej; animacje grają bez locku.
+
+					// Prędkość: najpierw parametr z komendy (jeśli podany), inaczej INI (PlaySceneSpeed).
+					float speed = optSpeed.has_value()
+						? std::clamp(*optSpeed, 0.1f, 10.0f)
+						: Animation::GraphManager::GetPlaySceneSpeed();
+					if (ok1) mgr->SetAnimationSpeed(a1, speed);
+					if (ok2) mgr->SetAnimationSpeed(a2, speed);
+					SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: speed={}", speed);
+				} catch (const std::exception& e) {
+					SAF_LOG_ERROR("[TASK] ExecutePlaySceneTask: exception {}", e.what());
+				} catch (...) {
+					SAF_LOG_ERROR("[TASK] ExecutePlaySceneTask: unknown exception");
+				}
+
+				mgr->RequestGraphUpdate();
+
+				// Zamknij konsolę natychmiast z głównego wątku dla playscene
+				// (analogicznie do CloseConsoleMainThread wywoływanego z Input hooka).
+				CloseConsoleMainThread();
+				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: EXIT");
+			});
 	}
 
 	// Helper do konwersji typów MCF na std::string_view (data/size są członkami, nie metodami)
@@ -879,21 +974,62 @@ namespace Commands::SAFCommand
 
 			// Komendy synchroniczne (help) - mogą używać itfc
 			if (cmd == "help") {
-			SAF_LOG_INFO("[MCF] Run: handling 'help' command");
-			if (itfc) ShowHelp();
-			RequestCloseConsole();
-			SAF_LOG_INFO("[MCF] Run: EXIT (help)");
-			return;
-		}
+				SAF_LOG_INFO("[MCF] Run: handling 'help' command");
+				if (itfc) ShowHelp();
+				RequestCloseConsole();
+				SAF_LOG_INFO("[MCF] Run: EXIT (help)");
+				return;
+			}
 
-		// Komendy asynchroniczne (play) - tylko dodaj do kolejki, NIE używaj itfc
-		if (cmd == "play") {
-			SAF_LOG_INFO("[MCF] Run: handling 'play' command");
-			ProcessPlayCommand();
-			SAF_LOG_INFO("[MCF] Run: EXIT (play queued)");
-			return;
-		}
-		if (cmd == "stop") {
+			// Komendy asynchroniczne (play) - tylko dodaj do kolejki, NIE używaj itfc
+			if (cmd == "play") {
+				SAF_LOG_INFO("[MCF] Run: handling 'play' command");
+				ProcessPlayCommand();
+				SAF_LOG_INFO("[MCF] Run: EXIT (play queued)");
+				return;
+			}
+
+			// saf playscene <refId1> <refId2> <file1> <file2> [speed]
+			// speed – opcjonalne, np. 1.0 (x1), 2.0 (x2); gdy brak, używana jest wartość z INI (PlaySceneSpeed).
+			if (cmd == "playscene") {
+				SAF_LOG_INFO("[MCF] Run: handling 'playscene' command");
+				if (args.size() < 5) {
+					SAF_LOG_WARN("[MCF] playscene: requires 4 arguments: refId1 refId2 file1 file2 [speed]");
+					if (itfc) {
+						SafePrintLn(itfc, "Usage: saf playscene <refId1> <refId2> <file1> <file2> [speed]");
+					}
+					return;
+				}
+
+				std::string a1(ToSV(args[1]));
+				std::string a2(ToSV(args[2]));
+				std::string f1(ToSV(args[3]));
+				std::string f2(ToSV(args[4]));
+
+				std::optional<float> speed;
+				if (args.size() >= 6) {
+					auto speedOpt = Util::String::StrToFloat(std::string(ToSV(args[5])));
+					if (!speedOpt) {
+						SAF_LOG_WARN("[MCF] playscene: invalid speed value '{}'", std::string(ToSV(args[5])));
+						if (itfc) {
+							SafePrintLn(itfc, "SAF: playscene - invalid speed. Use a number like 1.0 or 2.0.");
+						}
+						return;
+					}
+					speed = *speedOpt;
+				}
+
+				QueuePlaySceneTask(a1, a2, f1, f2, speed);
+
+				if (itfc) {
+					SafePrintLn(itfc, "SAF: playscene queued. Close console (~) to see effect.");
+				}
+				RequestCloseConsole();
+				SAF_LOG_INFO("[MCF] Run: EXIT (playscene queued)");
+				return;
+			}
+
+			if (cmd == "stop") {
 			std::vector<RE::Actor*> toStop;
 			if (args.size() > 1) {
 				// Jawna lista aktorów: saf stop player 0x123 0x456
