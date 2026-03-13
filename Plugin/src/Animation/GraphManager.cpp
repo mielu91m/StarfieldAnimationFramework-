@@ -837,7 +837,9 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		uint32_t animFrameCount = 0;
 		// NAF-style API state
 		std::string currentAnimationPath;
-		float playbackSpeed = 1.0f;
+		// Domyślna prędkość odtwarzania (1000x w stosunku do 1.0).
+		// Można ją skalować przez SetAnimationSpeed (Papyrus/saf speed) lub komendę 'saf speed'.
+		float playbackSpeed = 1000.0f;
 		bool positionLocked = false;
 		// Światowa pozycja i orientacja, w którą chcemy „zakotwiczyć” aktora, gdy positionLocked = true.
 		// Wzorzec z algorytmu Ebanexa:
@@ -1079,6 +1081,66 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		m[0]=1.f-2.f*(yy+zz); m[1]=2.f*(xy-wz);    m[2]=2.f*(xz+wy);
 		m[3]=2.f*(xy+wz);     m[4]=1.f-2.f*(xx+zz); m[5]=2.f*(yz-wx);
 		m[6]=2.f*(xz-wy);     m[7]=2.f*(yz+wx);    m[8]=1.f-2.f*(xx+yy);
+	}
+
+	// Y-up (GLTF) → Z-up for a 3x3 rotation matrix (same as in ApplyTransformRaw). Used for face-bone result.
+	static void ApplyYUpToZUpMatrix(const float m[9], float out[9])
+	{
+		const bool flip = g_yUpToZUpConversionFlip.load(std::memory_order_acquire);
+		const bool useSimilarity = g_yUpToZUpConversionConjugate.load(std::memory_order_acquire);
+		if (useSimilarity) {
+			if (flip) {
+				out[0]=m[0]; out[1]=-m[2]; out[2]=m[1];
+				out[3]=-m[6]; out[4]=m[8]; out[5]=-m[7];
+				out[6]=m[3]; out[7]=-m[5]; out[8]=m[4];
+			} else {
+				out[0]=m[0]; out[1]=m[2]; out[2]=-m[1];
+				out[3]=m[6]; out[4]=m[8]; out[5]=-m[7];
+				out[6]=-m[3]; out[7]=-m[5]; out[8]=m[4];
+			}
+		} else {
+			out[0]=m[0]; out[1]=m[1]; out[2]=m[2];
+			if (flip) {
+				out[3]=-m[6]; out[4]=-m[7]; out[5]=-m[8];
+				out[6]=m[3]; out[7]=m[4]; out[8]=m[5];
+			} else {
+				out[3]=m[6]; out[4]=m[7]; out[5]=m[8];
+				out[6]=-m[3]; out[7]=-m[4]; out[8]=-m[5];
+			}
+		}
+	}
+
+	// Forward declaration (Mat3ToQuat is defined later in this file).
+	static void Mat3ToQuat(const float m[9], float& qx, float& qy, float& qz, float& qw);
+
+	// Compute result rotation in local space: result = delta * base, with delta = inv(rest)*anim and optional Y-up conversion.
+	// Used for face bones so we can blend (1-w)*gamePose + w*result in a single space (local) and avoid distortion.
+	static void ComputeResultRotationQuat(
+		const Animation::Transform& rest,
+		const Animation::Transform& anim,
+		const float a_gameBase[9],
+		float& out_qx, float& out_qy, float& out_qz, float& out_qw)
+	{
+		const Quat rq{ rest.rotation.x, rest.rotation.y, rest.rotation.z, rest.rotation.w };
+		const Quat aq{ anim.rotation.x, anim.rotation.y, anim.rotation.z, anim.rotation.w };
+		float dm[9];
+		QuatToMat(QuatMul(QuatConj(rq), aq), dm);
+		const bool doConversion = g_applyYUpToZUpConversion.load(std::memory_order_acquire);
+		const float* d;
+		float dmConv[9];
+		if (doConversion) {
+			ApplyYUpToZUpMatrix(dm, dmConv);
+			d = dmConv;
+		} else {
+			d = dm;
+		}
+		const float* b = a_gameBase;
+		// orderDeltaThenBase = true: result = d * b
+		float r00 = d[0]*b[0]+d[1]*b[3]+d[2]*b[6], r01 = d[0]*b[1]+d[1]*b[4]+d[2]*b[7], r02 = d[0]*b[2]+d[1]*b[5]+d[2]*b[8];
+		float r10 = d[3]*b[0]+d[4]*b[3]+d[5]*b[6], r11 = d[3]*b[1]+d[4]*b[4]+d[5]*b[7], r12 = d[3]*b[2]+d[4]*b[5]+d[5]*b[8];
+		float r20 = d[6]*b[0]+d[7]*b[3]+d[8]*b[6], r21 = d[6]*b[1]+d[7]*b[4]+d[8]*b[7], r22 = d[6]*b[2]+d[7]*b[5]+d[8]*b[8];
+		float res[9] = { r00, r01, r02, r10, r11, r12, r20, r21, r22 };
+		Mat3ToQuat(res, out_qx, out_qy, out_qz, out_qw);
 	}
 
 	// NAF-style apply: write full local 4x4 (rotation + translation + scale) to NiNode::local,
@@ -3239,6 +3301,25 @@ static bool InstallAnimGraphManagerCallHook()
 		SAF_LOG_INFO("[STOP] StopAnimation: done");
 	}
 
+	void GraphManager::StopAllAnimations()
+	{
+		std::vector<RE::Actor*> actorsToStop;
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			actorsToStop.reserve(g_actorGraphs.size());
+			for (auto& [id, state] : g_actorGraphs) {
+				RE::Actor* actor = RE::TESForm::LookupByID<RE::Actor>(id);
+				if (actor) {
+					actorsToStop.push_back(actor);
+				}
+			}
+		}
+		SAF_LOG_INFO("[STOP] StopAllAnimations: {} actor(s) to stop", actorsToStop.size());
+		for (RE::Actor* a : actorsToStop) {
+			StopAnimation(a);
+		}
+	}
+
 	void GraphManager::SyncGraphs(const std::vector<RE::Actor*>& a_actors)
 	{
 		if (a_actors.empty()) return;
@@ -3472,19 +3553,19 @@ static bool InstallAnimGraphManagerCallHook()
 
 		RE::TESFormID id = a_actor->GetFormID();
 		float preservedSpeed = 1.0f;
-		bool preservedLock = false;
-		float px = 0.0f, py = 0.0f, pz = 0.0f;
 		std::unordered_map<std::string, float> preservedVars;
 		{
 			std::lock_guard<std::mutex> lock(g_graphMutex);
 			auto it = g_actorGraphs.find(id);
 			if (it != g_actorGraphs.end()) {
 				preservedSpeed = it->second.playbackSpeed;
-				preservedLock = it->second.positionLocked;
-				px = it->second.positionX; py = it->second.positionY; pz = it->second.positionZ;
 				preservedVars = it->second.blendGraphVariables;
 			}
 		}
+
+		// Play = auto-lock pozycji (gdzie stoi aktor); Stop / koniec animacji = odblokowanie.
+		const RE::NiPoint3 pos = a_actor->GetPosition();
+		const RE::NiPoint3 ang = a_actor->GetAngle();
 
 		ActorGraphState state;
 		state.skeleton = skeleton;
@@ -3494,8 +3575,9 @@ static bool InstallAnimGraphManagerCallHook()
 		state.loggedFirstUpdate = false;
 		state.animFrameCount = 0;
 		state.playbackSpeed = preservedSpeed;
-		state.positionLocked = preservedLock;
-		state.positionX = px; state.positionY = py; state.positionZ = pz;
+		state.positionLocked = true;  // Automatycznie przy Play; odblokowanie przy Stop lub gdy animacja się skończy.
+		state.positionX = pos.x; state.positionY = pos.y; state.positionZ = pos.z;
+		state.angleX = ang.x; state.angleY = ang.y; state.angleZ = ang.z;
 		state.blendGraphVariables = std::move(preservedVars);
 
 		if (auto* cg = dynamic_cast<Animation::ClipGenerator*>(state.generator.get()))
@@ -3573,6 +3655,14 @@ bool GraphManager::ShouldDeferHookInstall() const
 			}
 		}
 
+		// Dla SAF używamy własnego delta (steady_clock), żeby prędkość odtwarzania była stosowana do rzeczywistego czasu.
+		// dt z gry (ReadAnimUpdateData) może być w złej jednostce/offsetcie i wtedy speed nic nie zmienia.
+		static std::chrono::steady_clock::time_point s_lastTick;
+		const auto now = std::chrono::steady_clock::now();
+		float dtToUse = std::chrono::duration<float>(now - s_lastTick).count();
+		if (dtToUse <= 0.0f || !std::isfinite(dtToUse) || dtToUse > 1.0f)
+			dtToUse = a_deltaSeconds > 0.0f && std::isfinite(a_deltaSeconds) ? a_deltaSeconds : 0.016f;
+
 		std::vector<RE::Actor*> sequenceAdvanceActors;
 		{
 			std::lock_guard<std::mutex> lock(g_graphMutex);
@@ -3584,6 +3674,7 @@ bool GraphManager::ShouldDeferHookInstall() const
 				}
 				return;
 			}
+			s_lastTick = now;  // tick tylko gdy faktycznie aktualizujemy grafy
 
 			static std::atomic<uint32_t> updateCount{ 0 };
 			const uint32_t ucount = ++updateCount;
@@ -3746,7 +3837,7 @@ bool GraphManager::ShouldDeferHookInstall() const
 
 			Animation::ClipGenerator* clipGen = dynamic_cast<Animation::ClipGenerator*>(state.generator.get());
 			if (clipGen) {
-				clipGen->SetDeltaTime(a_deltaSeconds);
+				clipGen->SetDeltaTime(dtToUse);
 				clipGen->SetSpeed(state.playbackSpeed);
 			}
 
@@ -3755,6 +3846,8 @@ bool GraphManager::ShouldDeferHookInstall() const
 			++state.animFrameCount;
 
 			if (clipGen && clipGen->IsFinished()) {
+				// Koniec animacji (nie loop) → automatyczne odblokowanie ruchu (WASD / AI).
+				state.positionLocked = false;
 				auto itSeq = g_actorSequenceState.find(id);
 				if (itSeq != g_actorSequenceState.end()) {
 					if (!actor) {
@@ -3766,8 +3859,8 @@ bool GraphManager::ShouldDeferHookInstall() const
 			}
 
 			if (ucount <= 5 || ucount % 600 == 0) {
-				SAF_LOG_INFO("[UPDATE] UpdateGraphs: actor={}, joints={}, dt={}",
-					id, state.skeleton->jointNames.size(), a_deltaSeconds);
+				SAF_LOG_INFO("[UPDATE] UpdateGraphs: actor={}, joints={}, dt={}, speed={}",
+					id, state.skeleton->jointNames.size(), dtToUse, state.playbackSpeed);
 			}
 
 			if (!actor) {
@@ -3813,27 +3906,15 @@ bool GraphManager::ShouldDeferHookInstall() const
 					++skippedRoot;
 					continue;
 				}
-				if (i < state.skeleton->controlledByGame.size() && state.skeleton->controlledByGame[i]) {
+
+				const char* jointName = (i < state.skeleton->jointNames.size()) ? state.skeleton->jointNames[i].c_str() : nullptr;
+				// Kości twarzy (Eye/Jaw/faceBone_*) – całkowicie zostawiamy silnikowi gry.
+				// SAF NIE pisze już do żadnej z tych kości, żeby uniknąć jakichkolwiek deformacji twarzy.
+				if (jointName && IsFaceJoint(jointName)) {
 					++skippedControlled;
 					continue;
 				}
-
-				const char* jointName = (i < state.skeleton->jointNames.size()) ? state.skeleton->jointNames[i].c_str() : nullptr;
-				// Kości twarzy – pomijamy tylko gdy AnimateFaceJoints=0 (gra nimi steruje). Gdy =1, animujemy je z blendem żeby nie znikały.
-				if (jointName && IsFaceJoint(jointName)) {
-					if (!g_animateFaceJoints.load(std::memory_order_acquire)) {
-						++skippedControlled;
-						continue;
-					}
-				}
-				// W trybie NAF nie piszemy do kości dłoni (palce, cup, Wrist) – gra nimi steruje (IK).
-				if (g_useNAFApplyMode.load(std::memory_order_acquire) && jointName) {
-					if (IsHandJoint(jointName)) {
-						++skippedControlled;
-						continue;
-					}
-				}
-				// Dłonie: jeśli klip nie animuje tej kości (brak kanału), nie nadpisuj – zostaw grze (naturalna poza/IK). Jak przy twarzy.
+				// Dłonie: jeśli klip nie animuje tej kości (brak kanału), nie nadpisuj – zostaw grze (naturalna poza/IK).
 				if (jointName && IsHandJoint(jointName)) {
 					if (i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
 						++skippedControlled;
@@ -3867,41 +3948,6 @@ bool GraphManager::ShouldDeferHookInstall() const
 
 				const float* base = (i < state.gameBaseRotations.size()) ? state.gameBaseRotations[i].data() : kIdentBase;
 
-				// Kości twarzy (AnimateFaceJoints=1):
-				// - jeśli klip ich nie animuje (brak kanałów), nie pisz nic (zostaw grze) – inaczej domyślne tracki potrafią "wyciąć" dolną twarz.
-				// - jeśli animuje: miksuj z pozą gry, żeby były animowane i nie znikały.
-				// - jeśli nie da się odczytać pozy gry: nie pisz (zostaw grze).
-				if (jointName && IsFaceJoint(jointName) && g_animateFaceJoints.load(std::memory_order_acquire)) {
-					if (i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
-						++skippedControlled;
-						continue;
-					}
-					Animation::Transform gamePose;
-					if (!ReadBoneFullTransform(state.jointNodes[i], g_niTransformOffset.load(std::memory_order_acquire), gamePose)) {
-						// Nie nadpisuj kości twarzy bez blendu – inaczej znika dolna część (usta, broda). Gra zostaje przy swojej pozie.
-						++skippedControlled;
-						continue;
-					}
-					float w = g_faceAnimStrength.load(std::memory_order_acquire);
-					if (w <= 0.0f || w > 1.0f) w = 0.5f;
-					if (w > 0.85f) w = 0.85f;  // cap: zawsze min. ~15% gry, żeby twarz nie znikała przy FaceAnimationStrength=1
-					const float iw = 1.0f - w;
-					float qx = iw * gamePose.rotation.x + w * anim.rotation.x;
-					float qy = iw * gamePose.rotation.y + w * anim.rotation.y;
-					float qz = iw * gamePose.rotation.z + w * anim.rotation.z;
-					float qw = iw * gamePose.rotation.w + w * anim.rotation.w;
-					const float qlen2 = qx*qx + qy*qy + qz*qz + qw*qw;
-					if (qlen2 > 1e-8f) {
-						const float invLen = 1.0f / std::sqrt(qlen2);
-						qx *= invLen; qy *= invLen; qz *= invLen; qw *= invLen;
-						anim.rotation.x = qx; anim.rotation.y = qy; anim.rotation.z = qz; anim.rotation.w = qw;
-					}
-					const float tw = 0.2f;  // 20% anim translation, 80% game – dolna część twarzy się nie rozjeżdża
-					anim.translation.x = (1.0f - tw) * gamePose.translation.x + tw * anim.translation.x;
-					anim.translation.y = (1.0f - tw) * gamePose.translation.y + tw * anim.translation.y;
-					anim.translation.z = (1.0f - tw) * gamePose.translation.z + tw * anim.translation.z;
-				}
-
 				// ── FRAMEDUMP: first 6 frames + frames 30,60,90 for key bones ──────────────
 				if (jointName && (state.animFrameCount <= 6 || state.animFrameCount == 30 || state.animFrameCount == 60 || state.animFrameCount == 90)) {
 					static const char* kFrameDumpBones[] = {
@@ -3932,13 +3978,19 @@ bool GraphManager::ShouldDeferHookInstall() const
 			}
 
 			if (actor) {
-				if (state.positionLocked) {
-					// „Twarde kotwienie” pozycji w świecie – po każdej klatce
-					// przywracamy aktora do zadanych współrzędnych.
-					// (Obrót nadal kontroluje silnik; brak publicznego SetAngle())
+				// Blokadę pozycji stosujemy tylko podczas odtwarzania; po zakończeniu animacji (IsFinished)
+				// nie blokujemy ruchu – gracz/NPC może znowu chodzić (WASD / AI).
+				const bool clipFinished = clipGen && !clipGen->IsLooping() && clipGen->IsFinished();
+				if (state.positionLocked && !clipFinished) {
+					// „Twarde kotwienie” pozycji i obrotu w świecie – po każdej klatce
+					// przywracamy aktora do zadanych współrzędnych i kątów (Euler).
 					RE::NiPoint3 pos(state.positionX, state.positionY, state.positionZ);
 					actor->SetPosition(pos, false);
-				} else {
+					// Blokada rotacji: REFR przechowuje kąt w data.angle; brak publicznego SetAngle() w API.
+					actor->data.angle.x = state.angleX;
+					actor->data.angle.y = state.angleY;
+					actor->data.angle.z = state.angleZ;
+				} else if (!clipFinished) {
 					auto itSync = g_syncOwner.find(id);
 					if (itSync != g_syncOwner.end() && itSync->second != id) {
 						RE::Actor* owner = RE::TESForm::LookupByID<RE::Actor>(itSync->second);

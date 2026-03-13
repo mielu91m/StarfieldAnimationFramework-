@@ -57,7 +57,7 @@
 
   • `akActor`   – actor to play the animation on.
   • `animId`    – animation identifier; the same string you use in the console
-                  with `saf play` (e.g. "test", "bw", "GE\\scene1.glb").
+                  with `saf play` (e.g. "MyAnimation", "Folder\\Scene1.glb").
   • `fSpeed`    – playback speed (in SAF **1.0 = normal**, 2.0 = 2× faster).
   • `animIndex` – index of the animation inside the file (0 = first, 1 = second...).
 
@@ -104,7 +104,7 @@
 
   In the current SAF version:
   • `fTransitionSeconds` is kept only for compatibility (future: blend time),
-  • playback speed is fixed at 1.0; to change speed use:
+  • playback speed is controlled via:
 
       Bool  Function SetAnimationSpeed(Actor akTarget, Float fSpeed) Global
       Float Function GetAnimationSpeed(Actor akTarget) Global
@@ -124,8 +124,8 @@
     Actor Property Target Auto
 
     Function PlayIdle()
-        ; play "bw" on Target at normal speed
-        Bool ok = SAFScript.PlayOnActor(Target, "bw", 1.0, 0)
+        ; play "MyAnimation" on Target at normal speed
+        Bool ok = SAFScript.PlayOnActor(Target, "MyAnimation", 1.0, 0)
         If ok
             Debug.Notification("SAF: animation started")
         Else
@@ -137,16 +137,16 @@
 8. CONSOLE USAGE (TESTING)
 --------------------------------------------------------------------------------
   The console does NOT understand expressions like:
-      SAF.PlayAnimation(14, "bw", 1.0)
+      SAF.PlayAnimation(14, "MyAnimation", 1.0)
 
   To call global functions use `cgf`:
 
     cgf "SAFScript.Ping"
-    cgf "SAFScript.PlayOnActor" 14 "bw" 1.0 0
+    cgf "SAFScript.PlayOnActor" 14 "MyAnimation" 1.0 0
 
   If you use the `SAF` wrapper:
 
-    cgf "SAF.PlayAnimation" 14 "bw" 1.0
+    cgf "SAF.PlayAnimation" 14 "MyAnimation" 1.0
 
   • `14` – example actor reference/formID (same as in other `cgf` calls).
 
@@ -157,9 +157,9 @@
       saf play <actorRef> <animId> [index]
 
   Typical examples:
-  • "test"        – looks for `test.glb` / `test.gltf` in Data\SAF\Animations\
-  • "test.glb"    – same, full filename
-  • "GE\\scene1"  – relative path inside animations folder (e.g. `GE\scene1.glb`)
+  • "MyAnimation"        – looks for `MyAnimation.glb` / `MyAnimation.gltf` in Data\SAF\Animations\
+  • "MyAnimation.glb"    – same, full filename
+  • "Folder\\Scene1"     – relative path inside animations folder (e.g. `Folder\Scene1.glb`)
 
 
 10. TESTING AND DEBUGGING
@@ -200,8 +200,39 @@
     Function StopSyncing(Actor akTarget)   native global
 
   Blend graph variables:
-    Bool  Function SetBlendGraphVariable(Actor akActor, String asName, Float fValue) native global
-    Float Function GetBlendGraphVariable(Actor akActor, String asName)               native global
+  Bool  Function SetBlendGraphVariable(Actor akActor, String asName, Float fValue) native global
+  Float Function GetBlendGraphVariable(Actor akActor, String asName)               native global
+
+
+13. NOTES ABOUT FACE, HANDS, POSITION AND SPEED
+--------------------------------------------------------------------------------
+  • Face bones:
+      SAF intentionally does NOT write to face bones anymore (eyes, mouth, jaw,
+      faceBone_*). Facial expressions remain fully controlled by the game or
+      other mods – SAF animations will not distort faces.
+
+  • Hands:
+      In NAF mode, hands are animated only if the clip has channels for hand
+      bones. If a particular hand bone has no channel, its transform is left
+      to the game (natural pose / IK).
+
+  • Position and rotation while playing:
+      When an animation starts, SAF captures the actor’s current world position
+      and rotation and „anchors” them – AI / WASD will not move the actor during
+      the clip. After calling StopAnimation or when the animation naturally ends
+      (non‑loop), the lock is removed and the actor can move again.
+      The helpers:
+        SAFScript.LockActorForAnimation(...)
+        SAFScript.UnlockActorAfterAnimation(...)
+      let you precisely define a shared scene origin from Papyrus.
+
+  • Animation speed:
+      The fSpeed parameter in PlayOnActor/PlayOnPlayer and the SetAnimationSpeed
+      function fully control the playback rate – SAF uses its own time delta and
+      multiplies it by playbackSpeed. In practice:
+        1.0  – normal speed
+        2.0  – roughly 2× faster
+        0.5  – roughly 2× slower
 
 
 ================================================================================

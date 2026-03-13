@@ -1,4 +1,4 @@
-Scriptname SAFTwoActorTest extends ScriptObject
+Scriptname SAFTwoActorTest1 extends ScriptObject
 
 Import SAFScript
 
@@ -27,19 +27,19 @@ Function Play(Actor akNpc) Global
     akNpc.SetRestrained(true)
 
     ; Używaj tej samej ścieżki, która działa w konsoli (log pokazał GE\C\cw.glb)
-    Bool ok1 = SAFScript.PlayOnActor(player, "GE\\C\\cw", 1.0, 0)
-    Bool ok2 = SAFScript.PlayOnActor(akNpc,  "GE\\C\\cm", 1.0, 0)
+    Bool ok1 = SAFScript.PlayOnActor(player, "GE\\s\\sw", 1.0, 0)
+    Bool ok2 = SAFScript.PlayOnActor(akNpc,  "GE\\s\\sm", 1.0, 0)
 
     if ok1
-        Debug.Notification("SAFTwoActorTest: player cw OK")
+        Debug.Notification("SAFTwoActorTest1: player sw OK")
     else
-        Debug.Notification("SAFTwoActorTest: player cw FAILED")
+        Debug.Notification("SAFTwoActorTest1: player sw FAILED")
     EndIf
 
     if ok2
-        Debug.Notification("SAFTwoActorTest: npc cm OK")
+        Debug.Notification("SAFTwoActorTest1: npc sm OK")
     else
-        Debug.Notification("SAFTwoActorTest: npc cm FAILED")
+        Debug.Notification("SAFTwoActorTest1: npc sm FAILED")
     EndIf
 
     if !ok1 || !ok2

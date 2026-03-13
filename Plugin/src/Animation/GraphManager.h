@@ -38,6 +38,8 @@ namespace Animation
 		void StartSequence(RE::Actor* a_actor, std::vector<Sequencer::PhaseData>&& a_phases, bool a_loop);
 		void DetachGenerator(RE::Actor* a_actor, float a_duration);
 		void StopAnimation(RE::Actor* a_actor);
+		// Stops all active SAF animations on all actors (used by 'saf stop' with no args).
+		void StopAllAnimations();
 		void SyncGraphs(const std::vector<RE::Actor*>& a_actors);
 		void StopSyncing(RE::Actor* a_actor);
 		void AdvanceSequence(RE::Actor* a_actor, bool a_smooth);

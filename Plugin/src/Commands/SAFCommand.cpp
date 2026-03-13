@@ -488,9 +488,6 @@ namespace Commands::SAFCommand
 					SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: LoadAndStartAnimation a1={} a2={} (ok1={}, ok2={})",
 						static_cast<void*>(a1), static_cast<void*>(a2), ok1, ok2);
 
-					// Nie blokujemy pozycji (SetGraphControlsPosition/SetActorPosition) – powodowało to crash w UpdateGraphs.
-					// Aktor 2 jest już ustawiony na pozycję aktora 1 wyżej; animacje grają bez locku.
-
 					// Prędkość: najpierw parametr z komendy (jeśli podany), inaczej INI (PlaySceneSpeed).
 					float speed = optSpeed.has_value()
 						? std::clamp(*optSpeed, 0.1f, 10.0f)
@@ -683,6 +680,8 @@ namespace Commands::SAFCommand
 		SafePrintLn(itfc, "saf list - Lists animation names in Data/SAF/Animations (.glb/.gltf/.saf).");
 		SafePrintLn(itfc, "saf speed [actorID] <value> - Set playback speed (default: crosshair/player).");
 		SafePrintLn(itfc, "saf loop [actorID] 0|1 - Set looping off/on (default: crosshair/player).");
+		SafePrintLn(itfc, "saf lock [actorID] - Lock position (auto on Play; use to re-lock if you unlocked).");
+		SafePrintLn(itfc, "saf unlock [actorID] - Unlock during animation. Auto-unlock on Stop or when animation ends.");
 		SafePrintLn(itfc, "saf validate <path> - Check GLB/GLTF bone names vs SAF skeleton (report missing).");
 		SafePrintLn(itfc, "saf optimize <file> [compression_level] - Optimizes GLTF to SAF");
 		SafePrintLn(itfc, "saf dumpbones [actorID] - Dumps actor 3D bone hierarchy to Data/SAF/Skeletons");
@@ -1030,48 +1029,24 @@ namespace Commands::SAFCommand
 			}
 
 			if (cmd == "stop") {
-			std::vector<RE::Actor*> toStop;
-			if (args.size() > 1) {
-				// Jawna lista aktorów: saf stop player 0x123 0x456
-				for (size_t i = 1; i < args.size(); ++i) {
-					RE::Actor* a = StrToActor(ToSV(args[i]), itfc != nullptr);
-					if (a) toStop.push_back(a);
-				}
-			} else {
-				// Brak argumentu: jak wcześniej – console ref / MCF selected / crosshair lub gracz.
-				RE::Actor* actor = nullptr;
-				auto* mgrMain = Animation::GraphManager::GetSingleton();
-				if (mgrMain) {
-					if (auto* consoleRef = GetConsoleReference(); consoleRef && consoleRef->IsActor()) {
-						actor = static_cast<RE::Actor*>(consoleRef);
-						SAF_LOG_INFO("[CMD] stop: using console selected ref");
-					}
-				}
-				if (!actor && itfc && mgrMain) {
-					try {
-						RE::NiPointer<RE::TESObjectREFR> sel = itfc->GetSelectedReference();
-						if (sel && sel->IsActor()) {
-							actor = static_cast<RE::Actor*>(sel.get());
-							SAF_LOG_INFO("[CMD] stop: using MCF selected ref");
-						}
-					} catch (const std::exception& e) {
-						SAF_LOG_WARN("[SAF] stop GetSelectedReference exception: {}", e.what());
-					} catch (...) {
-						SAF_LOG_WARN("[SAF] stop GetSelectedReference unknown exception");
-					}
-				}
-				if (!actor) {
-					actor = GetPlayerOrCrosshairActor();
-					if (actor) SAF_LOG_INFO("[CMD] stop: using player/crosshair actor");
-				}
-				if (actor) toStop.push_back(actor);
-			}
-
 			if (auto* mgr = Animation::GraphManager::GetSingleton()) {
-				for (RE::Actor* a : toStop)
-					mgr->StopAnimation(a);
-				if (!toStop.empty() && itfc)
-					SafePrintLn(itfc, toStop.size() > 1 ? "Animation stopped on " + std::to_string(toStop.size()) + " actors." : "Animation stopped.");
+				if (args.size() > 1) {
+					// Jawna lista aktorów: saf stop player 0x123 0x456
+					std::vector<RE::Actor*> toStop;
+					for (size_t i = 1; i < args.size(); ++i) {
+						RE::Actor* a = StrToActor(ToSV(args[i]), itfc != nullptr);
+						if (a) toStop.push_back(a);
+					}
+					for (RE::Actor* a : toStop)
+						mgr->StopAnimation(a);
+					if (!toStop.empty() && itfc)
+						SafePrintLn(itfc, toStop.size() > 1 ? "Animation stopped on " + std::to_string(toStop.size()) + " actors." : "Animation stopped.");
+				} else {
+					// Brak argumentów: globalny stop – zatrzymaj wszystkie aktywne animacje SAF.
+					mgr->StopAllAnimations();
+					if (itfc)
+						SafePrintLn(itfc, "SAF: All active animations stopped.");
+				}
 			}
 
 			RequestCloseConsole();
@@ -1154,6 +1129,25 @@ namespace Commands::SAFCommand
 			if (actor && Animation::GraphManager::GetSingleton()) {
 				Animation::GraphManager::GetSingleton()->SetAnimationLooping(actor, loop);
 				if (itfc) SafePrintLn(itfc, std::string("SAF: Loop ") + (loop ? "on." : "off."));
+			} else if (itfc) SafePrintLn(itfc, "SAF: No actor or no animation.");
+			RequestCloseConsole();
+			return;
+		}
+		if (cmd == "lock") {
+			RE::Actor* actor = (args.size() >= 2) ? StrToActor(ToSV(args[1]), itfc != nullptr) : GetPlayerOrCrosshairActor();
+			if (actor && Animation::GraphManager::GetSingleton()) {
+				Animation::GraphManager::GetSingleton()->SetActorPosition(actor, actor->GetPosition().x, actor->GetPosition().y, actor->GetPosition().z);
+				Animation::GraphManager::GetSingleton()->SetGraphControlsPosition(actor, true);
+				if (itfc) SafePrintLn(itfc, "SAF: Position locked. Unlocks when animation ends.");
+			} else if (itfc) SafePrintLn(itfc, "SAF: No actor or no animation.");
+			RequestCloseConsole();
+			return;
+		}
+		if (cmd == "unlock") {
+			RE::Actor* actor = (args.size() >= 2) ? StrToActor(ToSV(args[1]), itfc != nullptr) : GetPlayerOrCrosshairActor();
+			if (actor && Animation::GraphManager::GetSingleton()) {
+				Animation::GraphManager::GetSingleton()->SetGraphControlsPosition(actor, false);
+				if (itfc) SafePrintLn(itfc, "SAF: Position unlocked.");
 			} else if (itfc) SafePrintLn(itfc, "SAF: No actor or no animation.");
 			RequestCloseConsole();
 			return;
