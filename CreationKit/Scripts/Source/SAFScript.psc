@@ -15,6 +15,12 @@ Function SetAnimationSpeed(Actor akActor, Float fSpeed) native global
 Float Function GetAnimationSpeed(Actor akActor) native global
 Function SetGraphControlsPosition(Actor akActor, Bool bLocked) native global
 Function SetActorPosition(Actor akActor, Float fX, Float fY, Float fZ) native global
+; Zakotwicz aktora w (fX,fY,fZ) – przy następnym Play/StartSequence ta pozycja będzie trzymana. Odblokuj UnlockActorAfterAnimation po scenie.
+Function LockActorForAnimation(Actor akActor, Float fX, Float fY, Float fZ, Bool abIsPlayer = false) native global
+Function UnlockActorAfterAnimation(Actor akActor, Bool abIsPlayer = false) native global
+
+; Crosshair helper – returns the reference under the crosshair (same as player.crosshairRef)
+ObjectReference Function GetCrosshairRef() native global
 
 Int Function GetSequencePhase(Actor akActor) native global
 Bool Function SetSequencePhase(Actor akActor, Int iPhase) native global

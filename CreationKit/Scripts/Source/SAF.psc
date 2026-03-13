@@ -1,5 +1,7 @@
 Scriptname SAF extends ScriptObject
 
+Import SAFScript
+
 Struct SequencePhase
     ; If set to -1, will loop infinitely. If set to 0, indicates a play-once/non-looping animation.
     Int numLoops = 0
@@ -100,4 +102,58 @@ EndFunction
 
 Function UnregisterForSequenceEnd(ScriptObject sScript) Global
     SAFScript.UnregisterForSequenceEnd(sScript)
+EndFunction
+
+; Wybiera aktora ze sceny najbliżej celownika (z tablicy scenicznych aktorów).
+; Najpierw próbuje użyć SAFScript.GetCrosshairRef, a jeśli ref nie należy do sceny,
+; bierze aktora o najmniejszym kącie względem kierunku patrzenia gracza.
+Actor Function PickActorFromCrosshair(Actor[] sceneActors, Float maxAngle = 20.0, Float maxDist = 3000.0) Global
+    If sceneActors == None || sceneActors.Length == 0
+        return None
+    EndIf
+
+    Actor player = Game.GetPlayer()
+
+    ; 1) Próba z natywnym crosshairRef
+    ObjectReference ref = SAFScript.GetCrosshairRef()
+    Actor hitActor = ref as Actor
+    If hitActor
+        Int i = 0
+        While i < sceneActors.Length
+            If sceneActors[i] == hitActor
+                return hitActor
+            EndIf
+            i += 1
+        EndWhile
+    EndIf
+
+    ; 2) Fallback: wybierz aktora o najmniejszym kącie względem celownika
+    Actor best = None
+    Float bestScore = maxAngle
+
+    Int j = 0
+    While j < sceneActors.Length
+        Actor a = sceneActors[j]
+        If a
+            Float dist = player.GetDistance(a)
+            If dist <= maxDist
+                Float ang = Math.Abs(player.GetHeadingAngle(a)) ; 0 = idealnie w celowniku
+                If ang < bestScore
+                    bestScore = ang
+                    best = a
+                EndIf
+            EndIf
+        EndIf
+        j += 1
+    EndWhile
+
+    return best
+EndFunction
+
+; Dla dwóch aktorów: zwraca tego, który jest bliżej celownika (spośród pary scenicznej).
+Actor Function PickPairActorFromCrosshair(Actor firstActor, Actor secondActor, Float maxAngle = 20.0, Float maxDist = 3000.0) Global
+    Actor[] arr = new Actor[2]
+    arr[0] = firstActor
+    arr[1] = secondActor
+    return PickActorFromCrosshair(arr, maxAngle, maxDist)
 EndFunction

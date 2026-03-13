@@ -862,6 +862,8 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 	static std::unordered_map<RE::TESFormID, ActorGraphState> g_actorGraphs;
 	static std::unordered_map<RE::TESFormID, ActorSequenceState> g_actorSequenceState;
 	static std::unordered_map<RE::TESFormID, RE::TESFormID> g_syncOwner;  // actor formId -> owner formId (owner points to self)
+	struct PendingLock { float x = 0, y = 0, z = 0; };
+	static std::unordered_map<RE::TESFormID, PendingLock> g_pendingLockPosition;  // ustawiane przez LockActorForAnimation, zużywane w AttachGenerator
 	static std::mutex g_graphMutex;
 	// Set of actors we already logged access-violation for (SafeBuildJointMap); file scope to avoid C2712 with __try.
 	static std::unordered_set<RE::Actor*> g_loggedAvActorsBuildJointMap;
@@ -3411,6 +3413,30 @@ static bool InstallAnimGraphManagerCallHook()
 		if (it != g_actorGraphs.end()) it->second.positionLocked = a_lock;
 	}
 
+	void GraphManager::LockActorForAnimation(RE::Actor* a_actor, float a_x, float a_y, float a_z)
+	{
+		if (!a_actor) return;
+		RE::TESFormID id = a_actor->GetFormID();
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		g_pendingLockPosition[id] = PendingLock{ a_x, a_y, a_z };
+		auto it = g_actorGraphs.find(id);
+		if (it != g_actorGraphs.end()) {
+			it->second.positionX = a_x; it->second.positionY = a_y; it->second.positionZ = a_z;
+			const RE::NiPoint3 ang = a_actor->GetAngle();
+			it->second.angleX = ang.x; it->second.angleY = ang.y; it->second.angleZ = ang.z;
+			it->second.positionLocked = true;
+		}
+	}
+
+	void GraphManager::UnlockActorAfterAnimation(RE::Actor* a_actor)
+	{
+		if (!a_actor) return;
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		g_pendingLockPosition.erase(a_actor->GetFormID());
+		auto it = g_actorGraphs.find(a_actor->GetFormID());
+		if (it != g_actorGraphs.end()) it->second.positionLocked = false;
+	}
+
 	std::string GraphManager::GetCurrentAnimation(RE::Actor* a_actor) const
 	{
 		if (!a_actor) return "";
@@ -3497,18 +3523,72 @@ static bool InstallAnimGraphManagerCallHook()
 	bool GraphManager::SetSequencePhase(RE::Actor* a_actor, int a_phase)
 	{
 		if (!a_actor) return false;
-		std::string phaseFile;
-		bool phaseLoop = true;
+
+		// Ujednolicone przełączanie fazy dla wszystkich aktorów w grupie SyncGraphs:
+		// wywołanie SetSequencePhase na jednym aktorze przełącza tę samą fazę
+		// na wszystkich aktorach zsynchronizowanych (wspólny ownerId).
+		struct PendingPhase
+		{
+			RE::TESFormID id;
+			std::string   file;
+			bool          loop;
+		};
+		std::vector<PendingPhase> toApply;
+
+		const RE::TESFormID callerId = a_actor->GetFormID();
+		RE::TESFormID ownerId = callerId;
 		{
 			std::lock_guard<std::mutex> lock(g_graphMutex);
-			auto it = g_actorSequenceState.find(a_actor->GetFormID());
-			if (it == g_actorSequenceState.end() || a_phase < 0 || a_phase >= static_cast<int>(it->second.phases.size())) return false;
-			it->second.currentPhaseIndex = a_phase;
-			phaseFile = it->second.phases[a_phase].file;
-			phaseLoop = (it->second.phases[a_phase].loopCount != 0);
+
+			// Ustal ownera grupy (SyncGraphs zapisuje ownerId dla wszystkich aktorów, łącznie z właścicielem).
+			auto itOwner = g_syncOwner.find(callerId);
+			if (itOwner != g_syncOwner.end()) {
+				ownerId = itOwner->second;
+			}
+
+			// Przejdź przez wszystkie sekwencje i znajdź te, które należą do tej samej grupy ownerId.
+			for (auto& [id, seq] : g_actorSequenceState) {
+				// Sprawdź przynależność do grupy synchronizacji.
+				RE::TESFormID grpOwner = id;
+				auto itSync = g_syncOwner.find(id);
+				if (itSync != g_syncOwner.end()) {
+					grpOwner = itSync->second;
+				}
+				if (grpOwner != ownerId) {
+					continue;
+				}
+
+				if (a_phase < 0 || a_phase >= static_cast<int>(seq.phases.size())) {
+					continue;
+				}
+
+				seq.currentPhaseIndex = a_phase;
+				const auto& phase = seq.phases[a_phase];
+				PendingPhase p;
+				p.id   = id;
+				p.file = phase.file;
+				p.loop = (phase.loopCount != 0);
+				toApply.push_back(std::move(p));
+			}
 		}
-		LoadAndStartAnimation(a_actor, phaseFile, phaseLoop);
-		Papyrus::EventManager::GetSingleton()->DispatchPhaseBegin(a_actor, a_phase, phaseFile);
+
+		if (toApply.empty()) {
+			return false;
+		}
+
+		// Poza mutexem: uruchom nową fazę na wszystkich aktorach w grupie.
+		for (const auto& p : toApply) {
+			RE::Actor* actor = RE::TESForm::LookupByID<RE::Actor>(p.id);
+			if (!actor && p.id == 0x14) {
+				actor = RE::PlayerCharacter::GetSingleton();
+			}
+			if (!actor) {
+				continue;
+			}
+			LoadAndStartAnimation(actor, p.file, p.loop);
+			Papyrus::EventManager::GetSingleton()->DispatchPhaseBegin(actor, a_phase, p.file);
+		}
+
 		return true;
 	}
 
@@ -3554,18 +3634,39 @@ static bool InstallAnimGraphManagerCallHook()
 		RE::TESFormID id = a_actor->GetFormID();
 		float preservedSpeed = 1.0f;
 		std::unordered_map<std::string, float> preservedVars;
+		float posX = 0, posY = 0, posZ = 0;
+		float angX = 0, angY = 0, angZ = 0;
+		bool lockPosition = false;
 		{
 			std::lock_guard<std::mutex> lock(g_graphMutex);
 			auto it = g_actorGraphs.find(id);
 			if (it != g_actorGraphs.end()) {
 				preservedSpeed = it->second.playbackSpeed;
 				preservedVars = it->second.blendGraphVariables;
+				// Multi-anim: zachowaj blokadę i pozycję z poprzedniej animacji (blokada → anim → blokada → anim → …).
+				if (it->second.positionLocked) {
+					posX = it->second.positionX; posY = it->second.positionY; posZ = it->second.positionZ;
+					angX = it->second.angleX; angY = it->second.angleY; angZ = it->second.angleZ;
+					lockPosition = true;
+				}
+			}
+			if (!lockPosition) {
+				auto itPending = g_pendingLockPosition.find(id);
+				if (itPending != g_pendingLockPosition.end()) {
+					posX = itPending->second.x; posY = itPending->second.y; posZ = itPending->second.z;
+					const RE::NiPoint3 ang = a_actor->GetAngle();
+					angX = ang.x; angY = ang.y; angZ = ang.z;
+					lockPosition = true;
+					g_pendingLockPosition.erase(itPending);
+				}
 			}
 		}
-
-		// Play = auto-lock pozycji (gdzie stoi aktor); Stop / koniec animacji = odblokowanie.
-		const RE::NiPoint3 pos = a_actor->GetPosition();
-		const RE::NiPoint3 ang = a_actor->GetAngle();
+		if (!lockPosition) {
+			const RE::NiPoint3 pos = a_actor->GetPosition();
+			const RE::NiPoint3 ang = a_actor->GetAngle();
+			posX = pos.x; posY = pos.y; posZ = pos.z;
+			angX = ang.x; angY = ang.y; angZ = ang.z;
+		}
 
 		ActorGraphState state;
 		state.skeleton = skeleton;
@@ -3575,9 +3676,9 @@ static bool InstallAnimGraphManagerCallHook()
 		state.loggedFirstUpdate = false;
 		state.animFrameCount = 0;
 		state.playbackSpeed = preservedSpeed;
-		state.positionLocked = true;  // Automatycznie przy Play; odblokowanie przy Stop lub gdy animacja się skończy.
-		state.positionX = pos.x; state.positionY = pos.y; state.positionZ = pos.z;
-		state.angleX = ang.x; state.angleY = ang.y; state.angleZ = ang.z;
+		state.positionLocked = lockPosition;
+		state.positionX = posX; state.positionY = posY; state.positionZ = posZ;
+		state.angleX = angX; state.angleY = angY; state.angleZ = angZ;
 		state.blendGraphVariables = std::move(preservedVars);
 
 		if (auto* cg = dynamic_cast<Animation::ClipGenerator*>(state.generator.get()))
@@ -3908,9 +4009,20 @@ bool GraphManager::ShouldDeferHookInstall() const
 				}
 
 				const char* jointName = (i < state.skeleton->jointNames.size()) ? state.skeleton->jointNames[i].c_str() : nullptr;
-				// Kości twarzy (Eye/Jaw/faceBone_*) – całkowicie zostawiamy silnikowi gry.
-				// SAF NIE pisze już do żadnej z tych kości, żeby uniknąć jakichkolwiek deformacji twarzy.
-				if (jointName && IsFaceJoint(jointName)) {
+				// Kości twarzy (Eye/Jaw/faceBone_*) – domyślnie zostawiamy silnikowi gry,
+				// z WYJĄTKIEM centralnych kości ust/szczęki:
+				//   faceBone_C_MouthPivot   – pivot żuchwy (otwieranie ust)
+				//   faceBone_C_LipsTop      – górna warga
+				//   faceBone_C_LipsBottom   – dolna warga
+				// Te trzy są animowane przez SAF (np. do prostych ruchów ust), reszta twarzy
+				// pozostaje pod pełną kontrolą FaceGen / morphów.
+				const bool isFace = jointName && IsFaceJoint(jointName);
+				const bool isLipsOrJawCenter =
+					jointName &&
+					(std::strcmp(jointName, "faceBone_C_LipsTop") == 0 ||
+					 std::strcmp(jointName, "faceBone_C_LipsBottom") == 0 ||
+					 std::strcmp(jointName, "faceBone_C_MouthPivot") == 0);
+				if (isFace && !isLipsOrJawCenter) {
 					++skippedControlled;
 					continue;
 				}
@@ -3982,11 +4094,9 @@ bool GraphManager::ShouldDeferHookInstall() const
 				// nie blokujemy ruchu – gracz/NPC może znowu chodzić (WASD / AI).
 				const bool clipFinished = clipGen && !clipGen->IsLooping() && clipGen->IsFinished();
 				if (state.positionLocked && !clipFinished) {
-					// „Twarde kotwienie” pozycji i obrotu w świecie – po każdej klatce
-					// przywracamy aktora do zadanych współrzędnych i kątów (Euler).
+					// „Twarde kotwienie” pozycji i obrotu (tylko gdy LockActorForAnimation / SetGraphControlsPosition).
 					RE::NiPoint3 pos(state.positionX, state.positionY, state.positionZ);
 					actor->SetPosition(pos, false);
-					// Blokada rotacji: REFR przechowuje kąt w data.angle; brak publicznego SetAngle() w API.
 					actor->data.angle.x = state.angleX;
 					actor->data.angle.y = state.angleY;
 					actor->data.angle.z = state.angleZ;

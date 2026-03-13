@@ -235,6 +235,57 @@
         0.5  – roughly 2× slower
 
 
+14. AIMING & ACTOR PICKING (GetCrosshairRef + SAF helpers)
+--------------------------------------------------------------------------------
+  • GetCrosshairRef (SAFScript):
+      ObjectReference Function GetCrosshairRef() native global
+
+      Returns the reference under the crosshair (same as player.crosshairRef),
+      or None if there is nothing. Typical usage:
+
+        ObjectReference ref = SAFScript.GetCrosshairRef()
+        Actor npc = ref as Actor
+        If npc
+            SAFScript.PlayOnActor(npc, \"MyAnimation\")
+        EndIf
+
+  • Picking a scene actor under the crosshair (SAF.psc):
+
+      Actor Function PickActorFromCrosshair(Actor[] sceneActors,
+                                            Float maxAngle = 20.0,
+                                            Float maxDist = 3000.0) Global
+
+      - Pass an array of actors participating in the scene.
+      - The function first checks whether SAFScript.GetCrosshairRef() returns
+        one of them; if so, it returns that actor.
+      - If not, it chooses the actor with the smallest heading angle from
+        the player’s view direction (within maxAngle and maxDist).
+
+      For the common 2‑actor case there is a shortcut:
+
+        Actor Function PickPairActorFromCrosshair(Actor firstActor,
+                                                  Actor secondActor,
+                                                  Float maxAngle = 20.0,
+                                                  Float maxDist = 3000.0) Global
+
+  • Example: weapon controlling scene phases (pseudo‑code):
+
+        Event OnWeaponFire(...)
+            Actor hit = SAF.PickPairActorFromCrosshair(FirstActor, SecondActor)
+            If hit == None
+                return
+            EndIf
+
+            If hit == FirstActor
+                Int phase = SAFScript.GetSequencePhase(FirstActor)
+                SAFScript.SetSequencePhase(FirstActor, phase + 1) ; forward scene
+            ElseIf hit == SecondActor
+                Int phase = SAFScript.GetSequencePhase(FirstActor)
+                SAFScript.SetSequencePhase(FirstActor, phase - 1) ; backward scene
+            EndIf
+        EndEvent
+
+
 ================================================================================
   GitHub: https://github.com/mielu91m/StarfieldAnimationFramework
 ================================================================================

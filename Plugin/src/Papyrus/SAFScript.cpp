@@ -33,7 +33,7 @@ namespace Papyrus::SAFScript
             return resolved;
         }
 
-        bool PlayOnActorImpl(RE::Actor* a_actor, std::string_view a_animId,
+		bool PlayOnActorImpl(RE::Actor* a_actor, std::string_view a_animId,
                              float a_speed = 1.0f, int a_animIndex = 0)
         {
             if (!a_actor) { SAF_LOG_WARN("[Papyrus] PlayOnActorImpl: actor is null"); return false; }
@@ -60,6 +60,19 @@ namespace Papyrus::SAFScript
             }
         }
     }
+
+	// Zwraca referencję pod celownikiem (player->crosshairRef), albo none, jeśli brak.
+	RE::TESObjectREFR* GetCrosshairRef(
+	    RE::BSScript::IVirtualMachine& /*a_vm*/,
+	    std::uint32_t /*a_stackID*/,
+	    std::monostate)
+	{
+	    auto* player = RE::PlayerCharacter::GetSingleton();
+	    if (!player) {
+	        return nullptr;
+	    }
+	    return player->crosshairRef;
+	}
 
     // =========================================================================
     // REJESTRACJA EVENTÓW – Global z parametrem ScriptObject (jak w NAF)
@@ -241,6 +254,26 @@ namespace Papyrus::SAFScript
             mgr->SetActorPosition(a_actor, a_x, a_y, a_z);
     }
 
+    void LockActorForAnimation(
+        RE::BSScript::IVirtualMachine&, std::uint32_t,
+        std::monostate,
+        RE::Actor* a_actor, float a_x, float a_y, float a_z, bool a_isPlayer)
+    {
+        (void)a_isPlayer;
+        if (auto* mgr = Animation::GraphManager::GetSingleton(); mgr && a_actor)
+            mgr->LockActorForAnimation(a_actor, a_x, a_y, a_z);
+    }
+
+    void UnlockActorAfterAnimation(
+        RE::BSScript::IVirtualMachine&, std::uint32_t,
+        std::monostate,
+        RE::Actor* a_actor, bool a_isPlayer)
+    {
+        (void)a_isPlayer;
+        if (auto* mgr = Animation::GraphManager::GetSingleton(); mgr && a_actor)
+            mgr->UnlockActorAfterAnimation(a_actor);
+    }
+
     int GetSequencePhase(
         RE::BSScript::IVirtualMachine&, std::uint32_t,
         std::monostate, RE::Actor* a_actor)
@@ -322,7 +355,7 @@ namespace Papyrus::SAFScript
     }
 
     // =========================================================================
-    bool Bind(RE::BSScript::IVirtualMachine* a_vm)
+		bool Bind(RE::BSScript::IVirtualMachine* a_vm)
     {
         if (!a_vm) { SAF_LOG_ERROR("Cannot bind SAFScript: VM null"); return false; }
         const char* N = "SAFScript";
@@ -334,7 +367,7 @@ namespace Papyrus::SAFScript
             a_vm->BindNativeMethod(N, "UnregisterForPhaseBegin",  UnregisterForPhaseBegin,  true, false);
             a_vm->BindNativeMethod(N, "UnregisterForSequenceEnd", UnregisterForSequenceEnd, true, false);
 
-            a_vm->BindNativeMethod(N, "PlayOnActor",              PlayOnActor,              true, false);
+			a_vm->BindNativeMethod(N, "PlayOnActor",              PlayOnActor,              true, false);
             a_vm->BindNativeMethod(N, "PlayOnPlayer",             PlayOnPlayer,             true, false);
             a_vm->BindNativeMethod(N, "PlayOnActors",             PlayOnActors,             true, false);
             a_vm->BindNativeMethod(N, "StopAnimation",            StopAnimation,            true, false);
@@ -343,6 +376,8 @@ namespace Papyrus::SAFScript
             a_vm->BindNativeMethod(N, "GetAnimationSpeed",        GetAnimationSpeed,        true, false);
             a_vm->BindNativeMethod(N, "SetGraphControlsPosition", SetGraphControlsPosition, true, false);
             a_vm->BindNativeMethod(N, "SetActorPosition",         SetActorPosition,         true, false);
+            a_vm->BindNativeMethod(N, "LockActorForAnimation",   LockActorForAnimation,   true, false);
+            a_vm->BindNativeMethod(N, "UnlockActorAfterAnimation", UnlockActorAfterAnimation, true, false);
             a_vm->BindNativeMethod(N, "GetSequencePhase",         GetSequencePhase,         true, false);
             a_vm->BindNativeMethod(N, "SetSequencePhase",         SetSequencePhase,         true, false);
             a_vm->BindNativeMethod(N, "AdvanceSequence",          AdvanceSequence,          true, false);
@@ -351,6 +386,7 @@ namespace Papyrus::SAFScript
             a_vm->BindNativeMethod(N, "SetBlendGraphVariable",    SetBlendGraphVariable,    true, false);
             a_vm->BindNativeMethod(N, "GetBlendGraphVariable",    GetBlendGraphVariable,    true, false);
             a_vm->BindNativeMethod(N, "StartSequence",            StartSequence,            true, false);
+			a_vm->BindNativeMethod(N, "GetCrosshairRef",          GetCrosshairRef,          true, false);
 
             SAF_LOG_INFO("SAFScript Papyrus functions bound successfully");
             return true;

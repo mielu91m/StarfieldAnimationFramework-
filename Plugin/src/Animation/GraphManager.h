@@ -44,6 +44,9 @@ namespace Animation
 		void StopSyncing(RE::Actor* a_actor);
 		void AdvanceSequence(RE::Actor* a_actor, bool a_smooth);
 		void SetGraphControlsPosition(RE::Actor* a_actor, bool a_lock);
+		/// Pozycja (x,y,z) do użycia przy następnym AttachGenerator; odblokowanie przez UnlockActorAfterAnimation.
+		void LockActorForAnimation(RE::Actor* a_actor, float a_x, float a_y, float a_z);
+		void UnlockActorAfterAnimation(RE::Actor* a_actor);
 		/// Prędkość odtwarzania w saf playscene (z INI PlaySceneSpeed). 1.0 = domyślna.
 		static float GetPlaySceneSpeed();
 
