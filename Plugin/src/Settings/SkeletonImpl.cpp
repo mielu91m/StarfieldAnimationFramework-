@@ -266,11 +266,19 @@ namespace Settings
 						}
 					}
 
-					// Nie wywołuj ModelDB::GetEntry tutaj – w PostDataLoad preładowanie NIF rasy (np. vanilla) może spowodować, że gra użyje tego modelu dla gracza i korpus SFF w ogóle się nie pojawi. Rest pose z NIF uzupełniamy dopiero w LoadSkeletonForRace (na żądanie, gdy gracz jest już w świecie).
 					const auto raceName = p.stem().string();
 
+					// Jak w NAF: zawsze wypełnij restPose z NIF rasy przez ModelDB.
+					// NAF wywołuje FillInSkeletonNIFData natychmiast w LoadBaseSkeletons
+					// (nie odkłada na LoadSkeletonForRace) – dzięki temu restPose kości
+					// (w tym penisa, genitaliów) jest prawidłowy od pierwszej klatki animacji.
+					// Bez tego delta+base używa identity jako restPose co może dawać błędne wyniki.
+					// UWAGA: FillInSkeletonNIFData sprawdza UseModelDBForRestPose w INI –
+					// jeśli wyłączone, funkcja zwraca false i restPose zostaje identity (bezpieczne).
+					FillInSkeletonNIFData(skele, raceName);
+
 					skeletons[raceName] = skele.BuildRuntime(raceName);
-					SAF_LOG_INFO("Loaded skeleton: {} (rest from NIF on first use via LoadSkeletonForRace)", raceName);
+					SAF_LOG_INFO("Loaded skeleton: {} (restPose from NIF if UseModelDBForRestPose=1)", raceName);
 
 				} catch (const std::exception& e) {
 					SAF_LOG_ERROR("Failed to parse skeleton {}: {}", p.string(), e.what());

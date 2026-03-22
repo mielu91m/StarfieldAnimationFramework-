@@ -1,18 +1,18 @@
 #pragma once
 
-#include <SFSE/Trampoline.h>
+#include <REL/Trampoline.h>
 
 namespace Util
 {
-	inline SFSE::Trampoline& GetTrampoline()
+	inline REL::Trampoline& GetTrampoline()
 	{
-		static SFSE::Trampoline trampoline;
+		static REL::Trampoline trampoline;
 		return trampoline;
 	}
 
 	inline void AllocTrampoline(size_t a_size)
 	{
 		auto& trampoline = GetTrampoline();
-		SFSE::AllocTrampoline(a_size);
+		trampoline.allocate(a_size);
 	}
 }

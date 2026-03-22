@@ -1,8 +1,10 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <filesystem>
 #include <optional>
@@ -10,6 +12,13 @@
 
 namespace Util::String
 {
+	inline bool CaseInsensitiveCompare(std::string_view a, std::string_view b)
+	{
+		return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+			return std::tolower(static_cast<unsigned char>(x)) == std::tolower(static_cast<unsigned char>(y));
+		});
+	}
+
     // Pobiera ścieżkę do folderu Data gry
     inline std::filesystem::path GetDataPath()
     {

@@ -2,10 +2,29 @@
 #include "PCH.h"
 #include <mutex>
 #include <type_traits>
+#include <variant>
+
+template <typename T, typename Variant>
+struct variant_index;
+
+template <typename T, typename... Types>
+struct variant_index<T, std::variant<Types...>>
+{
+	static constexpr std::size_t value = []() {
+		std::size_t result = 0;
+		bool found = ((std::is_same_v<T, Types> ? true : (++result, false)) || ...);
+		return found ? result : static_cast<std::size_t>(-1);
+	}();
+};
+
+template <typename T, typename Variant>
+inline constexpr std::size_t variant_index_v = variant_index<T, Variant>::value;
 
 namespace Util
 {
-    // Klasa pomocnicza do bezpiecznego dostępu wielowątkowego
+	float GetRandomFloat(float a_min, float a_max);
+
+	// Klasa pomocnicza do bezpiecznego dostępu wielowątkowego
     template <typename T>
     class Guarded {
     public:

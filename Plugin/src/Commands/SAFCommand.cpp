@@ -439,7 +439,7 @@ namespace Commands::SAFCommand
 			return;
 		}
 
-		taskInterface->AddTask(
+				taskInterface->AddTask(
 			[actorId1 = std::move(actorId1),
 			 actorId2 = std::move(actorId2),
 			 file1 = std::move(file1),
@@ -477,10 +477,11 @@ namespace Commands::SAFCommand
 				const std::string pathStr2 = path2.string();
 				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: resolved paths '{}' / '{}'", pathStr1, pathStr2);
 
-				// Aktor 1 zostaje w miejscu. Aktor 2 dostaje pozycję aktora 1 – odtwarzają w jednym miejscu.
-				RE::NiPoint3 pos1 = a1->GetPosition();
-				a2->SetPosition(pos1, false);
-				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: a2 moved to a1 position ({}, {}, {})", pos1.x, pos1.y, pos1.z);
+				// PrepareActorsForScene: blokada AI → wyrównanie pos+rot → macierz NiNode.
+				// Musi być przed LoadAndStartAnimation – inaczej AI nadpisze data.angle
+				// zanim AttachGenerator odczyta kąt aktora.
+				mgr->PrepareActorsForScene(a1, a2);
+				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: PrepareActorsForScene done");
 
 				try {
 					bool ok1 = mgr->LoadAndStartAnimation(a1, pathStr1, true, 0);
@@ -495,9 +496,9 @@ namespace Commands::SAFCommand
 					if (ok1) mgr->SetAnimationSpeed(a1, speed);
 					if (ok2) mgr->SetAnimationSpeed(a2, speed);
 					SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: speed={}", speed);
-				} catch (const std::exception& e) {
-					SAF_LOG_ERROR("[TASK] ExecutePlaySceneTask: exception {}", e.what());
-				} catch (...) {
+				} catch(const std::exception& exception) {
+					SAF_LOG_ERROR("[TASK] ExecutePlaySceneTask: exception {}", exception.what());
+				} catch(...) {
 					SAF_LOG_ERROR("[TASK] ExecutePlaySceneTask: unknown exception");
 				}
 
@@ -680,8 +681,8 @@ namespace Commands::SAFCommand
 		SafePrintLn(itfc, "saf list - Lists animation names in Data/SAF/Animations (.glb/.gltf/.saf).");
 		SafePrintLn(itfc, "saf speed [actorID] <value> - Set playback speed (default: crosshair/player).");
 		SafePrintLn(itfc, "saf loop [actorID] 0|1 - Set looping off/on (default: crosshair/player).");
-		SafePrintLn(itfc, "saf lock [actorID] - Lock position (auto on Play; use to re-lock if you unlocked).");
-		SafePrintLn(itfc, "saf unlock [actorID] - Unlock during animation. Auto-unlock on Stop or when animation ends.");
+		SafePrintLn(itfc, "saf lock [actorID] - Lock position/rotation during animation (less jerking). Use before/with play.");
+		SafePrintLn(itfc, "saf unlock [actorID] - Unlock. Full lock from Papyrus: SAF.LockActorForAnimationRestrained / UnlockActorAfterAnimationRestrained.");
 		SafePrintLn(itfc, "saf validate <path> - Check GLB/GLTF bone names vs SAF skeleton (report missing).");
 		SafePrintLn(itfc, "saf optimize <file> [compression_level] - Optimizes GLTF to SAF");
 		SafePrintLn(itfc, "saf dumpbones [actorID] - Dumps actor 3D bone hierarchy to Data/SAF/Skeletons");
@@ -1136,19 +1137,19 @@ namespace Commands::SAFCommand
 		if (cmd == "lock") {
 			RE::Actor* actor = (args.size() >= 2) ? StrToActor(ToSV(args[1]), itfc != nullptr) : GetPlayerOrCrosshairActor();
 			if (actor && Animation::GraphManager::GetSingleton()) {
-				Animation::GraphManager::GetSingleton()->SetActorPosition(actor, actor->GetPosition().x, actor->GetPosition().y, actor->GetPosition().z);
-				Animation::GraphManager::GetSingleton()->SetGraphControlsPosition(actor, true);
-				if (itfc) SafePrintLn(itfc, "SAF: Position locked. Unlocks when animation ends.");
-			} else if (itfc) SafePrintLn(itfc, "SAF: No actor or no animation.");
+				RE::NiPoint3 p = actor->GetPosition();
+				Animation::GraphManager::GetSingleton()->LockActorForAnimation(actor, p.x, p.y, p.z);
+				if (itfc) SafePrintLn(itfc, "SAF: Position/rotation locked. From Papyrus: SAF.LockActorForAnimationRestrained(actor, x, y, z).");
+			} else if (itfc) SafePrintLn(itfc, "SAF: No actor.");
 			RequestCloseConsole();
 			return;
 		}
 		if (cmd == "unlock") {
 			RE::Actor* actor = (args.size() >= 2) ? StrToActor(ToSV(args[1]), itfc != nullptr) : GetPlayerOrCrosshairActor();
 			if (actor && Animation::GraphManager::GetSingleton()) {
-				Animation::GraphManager::GetSingleton()->SetGraphControlsPosition(actor, false);
-				if (itfc) SafePrintLn(itfc, "SAF: Position unlocked.");
-			} else if (itfc) SafePrintLn(itfc, "SAF: No actor or no animation.");
+				Animation::GraphManager::GetSingleton()->UnlockActorAfterAnimation(actor);
+				if (itfc) SafePrintLn(itfc, "SAF: Unlocked.");
+			} else if (itfc) SafePrintLn(itfc, "SAF: No actor.");
 			RequestCloseConsole();
 			return;
 		}

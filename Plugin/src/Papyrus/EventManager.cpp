@@ -10,27 +10,25 @@ namespace Papyrus
 	void EventManager::RegisterScript(EventType a_type, VMHandle a_handle, std::string a_typeName, std::string a_funcName)
 	{
 		std::lock_guard lock(_mutex);
-		_registrations.push_back({ a_type, a_handle, std::move(a_typeName), std::move(a_funcName) });
-		SAF_LOG_INFO("Registered script for event type {} (handle={}, type={})", static_cast<int>(a_type), a_handle, _registrations.back().typeName);
+		_registrations[{ a_type, a_handle }] = RegisteredScript{ std::move(a_typeName), std::move(a_funcName) };
+		SAF_LOG_INFO("Registered script for event type {} (handle={})", static_cast<int>(a_type), a_handle);
 	}
 
 	void EventManager::UnregisterScript(EventType a_type, VMHandle a_handle)
 	{
 		std::lock_guard lock(_mutex);
-		auto it = std::remove_if(_registrations.begin(), _registrations.end(),
-			[a_type, a_handle](const RegisteredScript& r) { return r.type == a_type && r.handle == a_handle; });
-		_registrations.erase(it, _registrations.end());
+		_registrations.erase({ a_type, a_handle });
 		SAF_LOG_INFO("Unregistered script for event type {}", static_cast<int>(a_type));
 	}
 
 	void EventManager::DispatchPhaseBegin(RE::Actor* a_actor, int a_phaseIndex, const std::string& a_phaseName)
 	{
-		std::vector<RegisteredScript> copy;
+		std::vector<std::pair<VMHandle, RegisteredScript>> copy;
 		{
 			std::lock_guard lock(_mutex);
-			for (const auto& r : _registrations)
-				if (r.type == EventType::kPhaseBegin)
-					copy.push_back(r);
+			for (const auto& [key, r] : _registrations)
+				if (key.first == EventType::kPhaseBegin)
+					copy.emplace_back(key.second, r);
 		}
 		if (copy.empty()) return;
 
@@ -41,7 +39,7 @@ namespace Papyrus
 
 		RE::BSFixedString objName;
 		RE::BSFixedString funcName;
-		for (const auto& r : copy) {
+		for (const auto& [handle, r] : copy) {
 			objName = r.typeName.c_str();
 			funcName = r.funcName.c_str();
 			RE::Actor* actor = a_actor;
@@ -49,7 +47,7 @@ namespace Papyrus
 			std::string phaseName = a_phaseName;
 			RE::BSFixedString phaseNameStr(phaseName.c_str());
 			vm->DispatchMethodCall(
-				r.handle,
+				handle,
 				objName,
 				funcName,
 				[actor, phaseIndex, phaseNameStr](RE::BSScrapArray<RE::BSScript::Variable>& a_args) -> bool {
@@ -66,12 +64,12 @@ namespace Papyrus
 
 	void EventManager::DispatchSequenceEnd(RE::Actor* a_actor, const std::string& a_sequenceName)
 	{
-		std::vector<RegisteredScript> copy;
+		std::vector<std::pair<VMHandle, RegisteredScript>> copy;
 		{
 			std::lock_guard lock(_mutex);
-			for (const auto& r : _registrations)
-				if (r.type == EventType::kSequenceEnd)
-					copy.push_back(r);
+			for (const auto& [key, r] : _registrations)
+				if (key.first == EventType::kSequenceEnd)
+					copy.emplace_back(key.second, r);
 		}
 		if (copy.empty()) return;
 
@@ -82,13 +80,13 @@ namespace Papyrus
 
 		RE::BSFixedString objName;
 		RE::BSFixedString funcName;
-		for (const auto& r : copy) {
+		for (const auto& [handle, r] : copy) {
 			objName = r.typeName.c_str();
 			funcName = r.funcName.c_str();
 			RE::Actor* actor = a_actor;
 			RE::BSFixedString sequenceNameStr(a_sequenceName.c_str());
 			vm->DispatchMethodCall(
-				r.handle,
+				handle,
 				objName,
 				funcName,
 				[actor, sequenceNameStr](RE::BSScrapArray<RE::BSScript::Variable>& a_args) -> bool {
@@ -109,3 +107,4 @@ namespace Papyrus
 		SAF_LOG_INFO("EventManager::Reset - cleared registrations");
 	}
 }
+
