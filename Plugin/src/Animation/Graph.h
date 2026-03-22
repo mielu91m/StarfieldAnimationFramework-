@@ -5,12 +5,8 @@
 
 namespace Animation
 {
-	class IAnimEventHandler {
-    public:
-        virtual ~IAnimEventHandler() = default;
-        // Tutaj opcjonalne metody obsługi zdarzeń
-    };
-	
+	class IAnimEventHandler;  // Definicja w Generator.h
+
     class Node
     {
     public:

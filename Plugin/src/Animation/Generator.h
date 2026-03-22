@@ -10,6 +10,13 @@ namespace Animation
     // Forward declaration interfejsu
     class IAnimEventHandler;
 
+    class IAnimEventHandler
+    {
+    public:
+        virtual ~IAnimEventHandler() = default;
+        virtual void QueueEvent(const RE::BSFixedString& a_event, const RE::BSFixedString& a_arg) { (void)a_event; (void)a_arg; }
+    };
+
     class Generator
     {
     public:

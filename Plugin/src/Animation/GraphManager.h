@@ -31,6 +31,18 @@ namespace Animation
 		void SetAnimationLooping(RE::Actor* a_actor, bool a_loop);
 		bool GetAnimationLooping(RE::Actor* a_actor) const;
 		void SetActorPosition(RE::Actor* a_actor, float a_x, float a_y, float a_z);
+		/// Ustaw pozycję i rotację aktora a_target tak, aby odpowiadała a_source
+		/// (pozycja z GetPositionForSceneSync, rotacja z GetAngle). Aktualizuje
+		/// zarówno ref (data.location/angle), jak i stan grafu (positionX/Y/Z, angleX/Y/Z).
+		/// Kopiuje też macierz rotacji root NiNode bezpośrednio (nie czeka na tick silnika).
+		void MatchActorTransform(RE::Actor* a_target, RE::Actor* a_source);
+		/// Ustawia obu aktorów na pozycji a_actor1 z rotacją a_actor2.
+		/// Wywołaj przed LoadAndStartAnimation obu aktorów – zapewnia identyczny
+		/// transform startowy, co gwarantuje spójne gameBaseRotations.
+		/// Przygotowuje dwóch aktorów do sceny: blokuje AI, wyrównuje pozycję i rotację.
+		/// Schemat: backup flag → blokada AI → ustawienie pos+ang → macierz NiNode.
+		/// Wywołaj PRZED LoadAndStartAnimation. DetachGenerator odtworzy flagi po animacji.
+		void PrepareActorsForScene(RE::Actor* a_actor1, RE::Actor* a_actor2);
 		int GetSequencePhase(RE::Actor* a_actor) const;
 		bool SetSequencePhase(RE::Actor* a_actor, int a_phase);
 		bool SetBlendGraphVariable(RE::Actor* a_actor, const std::string& a_name, float a_value);
@@ -49,6 +61,8 @@ namespace Animation
 		void UnlockActorAfterAnimation(RE::Actor* a_actor);
 		/// Prędkość odtwarzania w saf playscene (z INI PlaySceneSpeed). 1.0 = domyślna.
 		static float GetPlaySceneSpeed();
+		/// Pozycja aktora do synchronizacji (tylko początkowy teleport w PlayScene): z 3D root world jeśli dostępny, inaczej GetPosition().
+		RE::NiPoint3 GetPositionForSceneSync(RE::Actor* a_actor) const;
 
 		template <typename T, typename U>
 		void RegisterForEvent(U* a_listener)
@@ -74,6 +88,23 @@ namespace Animation
 		}
 
 		void Reset();
+
+		/// Zapis/odczyt stanu animacji (jak w NAF). CreateSaveData wypełnia a_data; LoadSaveData odtwarza grafy i sync.
+		/// Pełna persystencja wymaga zapisu a_data do pliku zapisu (np. SFSE SerializationInterface) po stronie wywołującego.
+		struct SaveData {
+			struct BlendGraphVariable { std::string name; float value = 0.0f; };
+			struct RefData {
+				RE::TESFormID formId = 0;
+				RE::TESFormID syncOwner = 0;
+				std::string animFile;
+				float localTime = 0.0f;
+				float speedMult = 1.0f;
+				std::vector<BlendGraphVariable> blendVars;
+			};
+			std::vector<RefData> refs;
+		};
+		void CreateSaveData(SaveData& a_data);
+		void LoadSaveData(const SaveData& a_data);
 
 		/// Czy używać ModelDB::GetEntry do ładowania rest pose z NIF rasy.
 		static bool IsModelDBForRestPoseEnabled();
