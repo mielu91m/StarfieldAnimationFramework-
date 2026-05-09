@@ -62,6 +62,12 @@ target("StarfieldAnimationFramework")
     set_languages("c++23")
     set_runtimes("MD")
     
+    -- W release generujemy PDB (symbole debug) bez zmiany runtime na MDd
+    if is_mode("release") then
+        set_symbols("debug")  -- /Zi + .pdb
+        set_optimize("fast")  -- standardowa optymalizacja
+    end
+    
     -- POPRAWIONE: Flagi podstawowe osobno, forced include osobno
     add_cxflags(
         "/utf-8",
@@ -89,18 +95,35 @@ target("StarfieldAnimationFramework")
         "Plugin/src/Settings/*.cpp",
         "Plugin/src/Tasks/*.cpp",
         "Plugin/src/Util/*.cpp",
-        "Plugin/src/Animation/*.cpp",    
-        
+        "Plugin/src/Animation/*.cpp",
+        "Plugin/src/Animation/Procedural/*.cpp",
+        "Plugin/src/Animation/Jobs/*.cpp",
+        "Plugin/src/Physics/*.cpp",
+
         -- CommonLibSF
         "extern/commonlibsf/lib/commonlib-shared/src/REL/*.cpp",
         "extern/commonlibsf/lib/commonlib-shared/src/REX/*.cpp",
         "extern/commonlibsf/src/SFSE/*.cpp",
+        -- Minimal RE runtime support needed by Papyrus marshalling (avoid pulling the whole RE layer).
+        "extern/commonlibsf/src/RE/A/Array.cpp",
+        "extern/commonlibsf/src/RE/O/Object.cpp",
+        "extern/commonlibsf/src/RE/B/BSFixedString.cpp",
+        "extern/commonlibsf/src/RE/B/BSLock.cpp",
+        "extern/commonlibsf/src/RE/N/NiPoint.cpp",
+        "extern/commonlibsf/src/RE/N/NiMatrix3.cpp",
+        "extern/commonlibsf/src/RE/T/TypeInfo.cpp",
+        "extern/commonlibsf/src/RE/V/Variable.cpp",
         
         {
             cxflags = {
                 "/FIfix_literals.h",
                 "/FIREX/REX.h",
                 "/FIREL/REL.h",
+                -- Provides RE::ID (referenced as ID:: inside namespace RE)
+                "/FIRE/IDs.h",
+                -- Provides SF_RTTI/SF_VTABLE macros and RTTI/VTable ID tables
+                "/FIRE/IDs_RTTI.h",
+                "/FIRE/IDs_VTABLE.h",
                 "/FIcstdint",
                 "/FItype_traits",
                 "/FIstring",
@@ -151,12 +174,15 @@ target("StarfieldAnimationFramework")
     -- DEFINICJE
     --------------------------------------------------
     add_defines(
+        "TARGET_GAME_SF",
         "SFSE_SUPPORT_XBYAK",
-        "SF_VERSION=1_15_222",
+        "SF_VERSION=1_16_236",
         "WIN32_LEAN_AND_MEAN",
         "NOMINMAX",
         "_UNICODE",
         "UNICODE",
+        -- CommonLibSF headers use "...sv" literals directly in many headers
+        "ENABLE_GLOBAL_STRING_LITERALS",
         "SPDLOG_COMPILED_LIB",
         "SPDLOG_FMT_EXTERNAL"
     )
@@ -186,7 +212,6 @@ target("StarfieldAnimationFramework")
     -- EXPORT SYMBOLI / LINKER
     --------------------------------------------------
     add_shflags("/ignore:4217", "/ignore:4286")
-    -- Symbole RE:: (BSScript, Ni*) są w exe gry – rozwiązywane przy ładowaniu DLL
-    add_shflags("/FORCE:UNRESOLVED")
+    -- NIE używamy /FORCE:UNRESOLVED: ukrywa brakujące symbole i kończy się crashem przy wywołaniu Papyrusa.
     add_rules("utils.symbols.export_all")
     add_packages("ozz-animation", "fastgltf", "simdjson", "zlib", "zstr")
