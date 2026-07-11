@@ -4028,18 +4028,16 @@ static bool InstallAnimGraphManagerCallHook()
 			SAF_LOG_INFO("DetachGenerator: boolFlags restored for actor {:X}", id);
 		}
 
-		// Przywróć oryginalny kąt i pozycję aktora sprzed animacji.
-		// Zapobiega to „chodzeniu do tyłu" po zakończeniu sceny (AI dostaje prawidłowy kąt,
-		// a nie kąt sceny który był wymuszany podczas animacji).
+		// Przywróć oryginalną pozycję aktora sprzed animacji.
+		// NIE przywracaj kąta – AI mogło w międzyczasie zmienić docelową głowę
+		// (pathfinding, sandbox), a przywrócenie backupAngleZ powoduje że NPC
+		// idzie do tyłu/bokiem względem kierunku wyliczonego przez AI.
 		if (state.hadAngleBackup) {
-			a_actor->data.angle.x = state.backupAngleX;
-			a_actor->data.angle.y = state.backupAngleY;
-			a_actor->data.angle.z = state.backupAngleZ;
 			a_actor->data.location.x = state.backupPosX;
 			a_actor->data.location.y = state.backupPosY;
 			a_actor->data.location.z = state.backupPosZ;
 			state.hadAngleBackup = false;
-			SAF_LOG_INFO("DetachGenerator: angle restored for actor {:X} (angZ={:.4f})", id, state.backupAngleZ);
+			SAF_LOG_INFO("DetachGenerator: position restored for actor {:X} (angle kept as-is)", id);
 		}
 
 		g_actorGraphs.erase(it);
@@ -5443,7 +5441,12 @@ bool GraphManager::ShouldDeferHookInstall() const
 	bool GraphManager::IsActorPlaying(RE::Actor* a_actor) const
 	{
 		if (!a_actor) return false;
-		std::lock_guard<std::mutex> lock(g_graphMutex);
+		// Use try_lock to avoid deadlock when called from hooks during SAF update cycle
+		std::unique_lock<std::mutex> lock(g_graphMutex, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			// Failed to acquire lock - assume not playing to avoid deadlock
+			return false;
+		}
 		return g_actorGraphs.find(a_actor->GetFormID()) != g_actorGraphs.end();
 	}
 
