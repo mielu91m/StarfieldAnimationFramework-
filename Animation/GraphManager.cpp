@@ -1,4 +1,4 @@
-﻿#include "PCH.h"
+#include "PCH.h"
 #include <array>
 #include "Animation/GraphManager.h"
 #include "Commands/SAFCommand.h"
@@ -2768,20 +2768,7 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 				Settings::SetSafeToUseExtendedSkeleton(true);
 			}
 		}
-		// Log pierwsze 10 wywołań, potem co 60 (co ~1 sekundę przy 60 FPS)
-		if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: ENTRY (call #{})", callNum);
-		}
-		
-		// ProcessPendingCommands wywoływane na main thread (GraphUpdateHook)
-
-		if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: calling original function");
-		}
 		int64_t result = g_originalGraphUpdate ? g_originalGraphUpdate(a_this, a_param2, a_param3) : 0;
-		if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: original function returned, result={}", result);
-		}
 
 	auto* mgr = GraphManager::GetSingleton();
 		const DWORD curThread = GetCurrentThreadId();
@@ -2793,13 +2780,8 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 	const bool requested = Commands::SAFCommand::HasProcessRequest();
 	const bool hasDump = Commands::SAFCommand::HasPendingDump();
 	const bool dumpRequested = Commands::SAFCommand::ConsumeDumpRequest();
-	if (requested || hasPending || dumpRequested || hasDump) {
-		SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: pending flags (req={}, pending={}, dumpReq={}, dumpPending={}) thread={}",
-			requested, hasPending, dumpRequested, hasDump, curThread);
-		if (g_mainThreadId != curThread) {
-			SAF_LOG_INFO("GraphManager: main thread id rebind to {} (pending flags)", curThread);
-			g_mainThreadId = curThread;
-		}
+	if ((requested || hasPending || dumpRequested || hasDump) && g_mainThreadId != curThread) {
+		g_mainThreadId = curThread;
 	}
 	const bool isMainThread = (g_mainThreadId != 0 && curThread == g_mainThreadId);
 
@@ -2823,19 +2805,11 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		if (Commands::SAFCommand::ConsumeCloseConsole()) {
 			Commands::SAFCommand::CloseConsoleMainThread();
 		}
-		if (!isMainThread && (callNum <= 10 || callNum % 60 == 0)) {
-			SAF_LOG_WARN("[HOOK] GraphUpdateHookImpl: running ProcessPendingCommands on non-main thread {}", curThread);
-		}
 		Commands::SAFCommand::ProcessPendingCommands();
 	}
 	if (dumpRequested || hasDump) {
-		if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: calling ProcessPendingDump");
-		}
 		if (isMainThread) {
 			Commands::SAFCommand::ProcessPendingDump();
-		} else if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: skip ProcessPendingDump (non-main thread {})", curThread);
 		}
 	}
 
@@ -2850,22 +2824,11 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 				lastTick = now;
 				dtSeconds = dt.count();
 			}
-			if (!g_actorGraphs.empty()) {
-				if (callNum <= 10 || callNum % 60 == 0) {
-					SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: UpdateGraphs (graphs={}, dt={}, culled={})",
-						g_actorGraphs.size(), dtSeconds, modelCulled ? "true" : "false");
-				}
-			}
 			mgr->UpdateGraphs(dtSeconds);
 			g_updateGuard.clear(std::memory_order_release);
-		} else if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: UpdateGraphs skipped (guarded)");
 		}
 	}
 		
-		if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: EXIT");
-		}
 		return result;
 	}
 
@@ -3986,14 +3949,11 @@ static bool InstallAnimGraphManagerCallHook()
 
 	void GraphManager::DetachGenerator(RE::Actor* a_actor, float a_duration)
 	{
-		SAF_LOG_INFO("DetachGenerator: actor={}, duration={}",
-			static_cast<void*>(a_actor), a_duration);
 		if (!a_actor) return;
 		const RE::TESFormID id = a_actor->GetFormID();
 		std::lock_guard<std::mutex> lock(g_graphMutex);
 		auto it = g_actorGraphs.find(id);
 		if (it == g_actorGraphs.end()) {
-			SAF_LOG_WARN("DetachGenerator: no graph found for actor {:X}", id);
 			return;
 		}
 
@@ -4011,7 +3971,6 @@ static bool InstallAnimGraphManagerCallHook()
 					RestoreBoneTranslationRaw(node, off, t);
 				}
 			}
-			SAF_LOG_INFO("DetachGenerator: bone transforms restored for actor {:X}", id);
 		}
 
 		// Odpowiednik SetRestrained(false) po animacji – przywróć boolBits/boolFlags
@@ -4037,7 +3996,6 @@ static bool InstallAnimGraphManagerCallHook()
 			a_actor->data.location.y = state.backupPosY;
 			a_actor->data.location.z = state.backupPosZ;
 			state.hadAngleBackup = false;
-			SAF_LOG_INFO("DetachGenerator: position restored for actor {:X} (angle kept as-is)", id);
 		}
 
 		g_actorGraphs.erase(it);
@@ -4045,7 +4003,6 @@ static bool InstallAnimGraphManagerCallHook()
 		g_syncOwner.erase(id);
 		g_syncOwnerRootCache.erase(id);
 		g_pendingLockPosition.erase(id);
-		SAF_LOG_INFO("DetachGenerator: graph removed for actor {:X}", id);
 	}
 
 	// StopAnimation – called by "saf stop" console command.
@@ -4056,18 +4013,12 @@ static bool InstallAnimGraphManagerCallHook()
 			SAF_LOG_WARN("StopAnimation: actor is null");
 			return;
 		}
-		SAF_LOG_INFO("[STOP] StopAnimation: actor={:p}", static_cast<void*>(a_actor));
 		DetachGenerator(a_actor, 0.0f);
-		// UpdateWorldData so the renderer picks up the restored rotations immediately
 		SafeUpdateWorldData(a_actor, nullptr, nullptr);
-		// Odśwież kapsułę Havok po przywróceniu data.angle przez DetachGenerator.
-		// Bez tego kapsuła zachowuje rotację z animacji, a AI używa przywróconego kąta
-		// z data.angle – efekt: aktor chodzi do tyłu (kapsuła w jedną stronę, AI w drugą).
 		{
 			const RE::NiPoint3 curPos = a_actor->GetPosition();
 			a_actor->SetPosition(curPos, false);
 		}
-		SAF_LOG_INFO("[STOP] StopAnimation: done");
 	}
 
 	void GraphManager::StopAllAnimations()
@@ -5085,15 +5036,7 @@ bool GraphManager::ShouldDeferHookInstall() const
 								for (const char** d = kDumpBones; *d; ++d) {
 									if (jname == *d) { dump = true; break; }
 								}
-								if (!dump) continue;
-								const float* b = state.gameBaseRotations[si].data();
-								SAF_LOG_INFO("[BONEMAT] joint='{}' idx={} game_base_row0=[{:.4f},{:.4f},{:.4f}] row1=[{:.4f},{:.4f},{:.4f}] row2=[{:.4f},{:.4f},{:.4f}]",
-									jname, si, b[0],b[1],b[2], b[3],b[4],b[5], b[6],b[7],b[8]);
-								if (si < state.restTransforms.size()) {
-									const auto& r = state.restTransforms[si];
-									SAF_LOG_INFO("[BONEMAT] joint='{}' ozz_rest_q=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-										jname, r.rotation.x, r.rotation.y, r.rotation.z, r.rotation.w);
-								}
+							if (!dump) continue;
 							}
 						}
 					}
