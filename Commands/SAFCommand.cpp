@@ -10,8 +10,6 @@
 #include "Serialization/GLTFExport.h"
 #include "Settings/Settings.h"
 #include "Animation/GraphManager.h"
-#include "Animation/Face/Manager.h"
-#include "Animation/NIFBoneManager.h"
 #include "Animation/Ozz.h"
 #include "Util/OzzUtil.h"
 #include "Util/String.h"
@@ -24,6 +22,8 @@
 #include "REL/Offset2ID.h"
 #include "Papyrus/SAFScript.h"
 #include "Papyrus/EventManager.h"
+#include "Animation/Face/Manager.h"
+#include "Animation/NIFBoneManager.h"
 #include <Windows.h>
 #include <fstream>
 #include <queue>
@@ -38,11 +38,11 @@
 
 namespace Commands::SAFCommand
 {
-	RE::Actor* lastActor = nullptr;
-	std::filesystem::path lastFile;
-	MCF::ConsoleInterface* itfc = nullptr;
+	MCF::ConsoleInterface* itfc;
 	MCF::simple_array<MCF::simple_string_view> args;
 	const char* fullStr = nullptr;
+	RE::Actor* lastActor = nullptr;
+	std::filesystem::path lastFile;
 
 	// Kolejka odroczonych zleceń – wykonywana na głównym wątku
 	struct PendingPlay
@@ -269,22 +269,16 @@ namespace Commands::SAFCommand
 
 	static void QueueProcessPending()
 	{
-		SAF_LOG_INFO("[QUEUE] QueueProcessPending: scheduling main-thread request task");
 		if (auto* taskInterface = SFSE::GetTaskInterface()) {
 			taskInterface->AddTask([]() {
-				SAF_LOG_INFO("[TASK] RequestProcessPending: ENTRY");
 				try {
-					SAF_LOG_INFO("[TASK] About to call RequestProcessPending");
 					RequestProcessPending();
-					SAF_LOG_INFO("[TASK] RequestProcessPending returned successfully");
 					RequestCloseConsole();
-					SAF_LOG_INFO("[TASK] Requested pending processing + console close (main thread will consume)");
 				} catch (const std::exception& e) {
 					SAF_LOG_ERROR("[TASK] Exception in RequestProcessPending: {}", e.what());
 				} catch (...) {
 					SAF_LOG_ERROR("[TASK] Unknown exception in RequestProcessPending");
 				}
-				SAF_LOG_INFO("[TASK] RequestProcessPending: EXIT");
 			});
 			return;
 		}
@@ -295,7 +289,7 @@ namespace Commands::SAFCommand
 
 
 	// Gdy domyślny cel to gracz: jeśli pod celownikiem jest Actor (NPC), zwróć go; inaczej gracza.
-	// Wywoływać tylko z głównego wątku (odczyt commandTarget).
+	// Wywoływać tylko z głównego wątku (odczyt crosshairRef).
 	static RE::Actor* GetPlayerOrCrosshairActor()
 	{
 		RE::PlayerCharacter* player = RE::PlayerCharacter::GetSingleton();
@@ -533,7 +527,6 @@ namespace Commands::SAFCommand
 	// Wykonaj komendę play na głównym wątku przez SFSE TaskInterface
 	static void QueuePlayTask(std::string path, std::string actorId)
 	{
-		SAF_LOG_INFO("[TASK] QueuePlayTask: START - path='{}', actorId='{}'", path, actorId);
 		const auto* taskInterface = SFSE::GetTaskInterface();
 		if (!taskInterface) {
 			SAF_LOG_ERROR("[TASK] QueuePlayTask: SFSE TaskInterface not available");
@@ -541,45 +534,24 @@ namespace Commands::SAFCommand
 		}
 
 		taskInterface->AddTask([path = std::move(path), actorId = std::move(actorId)]() mutable {
-			std::stringstream ss;
-			ss << std::this_thread::get_id();
-			SAF_LOG_INFO("[TASK] ExecutePlayTask: ENTRY (thread_id={})", ss.str());
-
 			RE::Actor* actor = GetActorByRefID(actorId);
-			if (actorId.empty() || actorId == "player" || actorId == "0" || actorId == "14")
-				SAF_LOG_INFO("[TASK] ExecutePlayTask: player/crosshair actor={}", static_cast<void*>(actor));
-			else
-				SAF_LOG_INFO("[TASK] ExecutePlayTask: refID '{}' -> actor={}", actorId, static_cast<void*>(actor));
 
 			if (!actor) {
 				SAF_LOG_WARN("[TASK] ExecutePlayTask: actor not found, skipping command");
 				return;
 			}
 
-			SAF_LOG_INFO("[TASK] ExecutePlayTask: resolving path for '{}'", path);
 			auto resolvedPath = ResolveAnimationPathWithFallback(path);
 			std::string pathStr = resolvedPath.string();
-			SAF_LOG_INFO("[TASK] ExecutePlayTask: resolved path='{}'", pathStr);
 
-			SAF_LOG_INFO("[TASK] ExecutePlayTask: calling GraphManager::GetSingleton()");
 			auto* mgr = Animation::GraphManager::GetSingleton();
-			SAF_LOG_INFO("[TASK] ExecutePlayTask: GraphManager={}", static_cast<void*>(mgr));
-
-			SAF_LOG_INFO("[TASK] ExecutePlayTask: calling LoadAndStartAnimation(actor={}, path='{}')", static_cast<void*>(actor), pathStr);
 			(void)mgr->LoadAndStartAnimation(actor, pathStr);
-			SAF_LOG_INFO("[TASK] ExecutePlayTask: LoadAndStartAnimation returned");
 
-			SAF_LOG_INFO("[TASK] ExecutePlayTask: calling SetLastAnimInfo");
 			SetLastAnimInfo(pathStr, actor);
-			SAF_LOG_INFO("[TASK] ExecutePlayTask: SetLastAnimInfo returned");
 
 			// NIE zamykaj konsoli z wątku taska – UIMessageQueue z worker thread może powodować crash.
 			// Konsolę użytkownik zamyka ręcznie (np. ~).
-
-			SAF_LOG_INFO("[TASK] ExecutePlayTask: EXIT");
 		});
-
-		SAF_LOG_INFO("[TASK] QueuePlayTask: DONE - task queued");
 	}
 
 	// Wykonaj komendę playscene na głównym wątku:
@@ -592,9 +564,6 @@ namespace Commands::SAFCommand
 		std::string file2,
 		std::optional<float> optSpeed)
 	{
-		SAF_LOG_INFO("[TASK] QueuePlaySceneTask: START - a1='{}', a2='{}', f1='{}', f2='{}', speedOverride={}",
-			actorId1, actorId2, file1, file2, optSpeed ? std::to_string(*optSpeed) : "INI");
-
 		const auto* taskInterface = SFSE::GetTaskInterface();
 		if (!taskInterface) {
 			SAF_LOG_ERROR("[TASK] QueuePlaySceneTask: SFSE TaskInterface not available");
@@ -607,15 +576,8 @@ namespace Commands::SAFCommand
 			 file1 = std::move(file1),
 			 file2 = std::move(file2),
 			 optSpeed]() mutable {
-				std::stringstream ss;
-				ss << std::this_thread::get_id();
-				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: ENTRY (thread_id={})", ss.str());
-
 				RE::Actor* a1 = GetActorByRefID(actorId1);
 				RE::Actor* a2 = GetActorByRefID(actorId2);
-
-				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: a1Id='{}' -> {}", actorId1, static_cast<void*>(a1));
-				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: a2Id='{}' -> {}", actorId2, static_cast<void*>(a2));
 
 				if (!a1 || !a2) {
 					SAF_LOG_WARN("[TASK] ExecutePlaySceneTask: missing actor(s), aborting");
@@ -628,36 +590,25 @@ namespace Commands::SAFCommand
 					return;
 				}
 
-				// Alias/override -> klucz, potem rozwiąż ścieżkę jak w komendzie play
 				auto key1 = ResolveOverridePath(file1);
 				auto key2 = ResolveOverridePath(file2);
 
-				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: resolving paths '{}' / '{}'", key1, key2);
 				const auto path1 = ResolveAnimationPathWithFallback(key1);
 				const auto path2 = ResolveAnimationPathWithFallback(key2);
 				const std::string pathStr1 = path1.string();
 				const std::string pathStr2 = path2.string();
-				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: resolved paths '{}' / '{}'", pathStr1, pathStr2);
 
-				// PrepareActorsForScene: blokada AI → wyrównanie pos+rot → macierz NiNode.
-				// Musi być przed LoadAndStartAnimation – inaczej AI nadpisze data.angle
-				// zanim AttachGenerator odczyta kąt aktora.
 				mgr->PrepareActorsForScene(a1, a2);
-				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: PrepareActorsForScene done");
 
 				try {
 					bool ok1 = mgr->LoadAndStartAnimation(a1, pathStr1, true, 0);
 					bool ok2 = mgr->LoadAndStartAnimation(a2, pathStr2, true, 0);
-					SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: LoadAndStartAnimation a1={} a2={} (ok1={}, ok2={})",
-						static_cast<void*>(a1), static_cast<void*>(a2), ok1, ok2);
 
-					// Prędkość: najpierw parametr z komendy (jeśli podany), inaczej INI (PlaySceneSpeed).
 					float speed = optSpeed.has_value()
 						? std::clamp(*optSpeed, 0.1f, 10.0f)
 						: Animation::GraphManager::GetPlaySceneSpeed();
 					if (ok1) mgr->SetAnimationSpeed(a1, speed);
 					if (ok2) mgr->SetAnimationSpeed(a2, speed);
-					SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: speed={}", speed);
 				} catch(const std::exception& exception) {
 					SAF_LOG_ERROR("[TASK] ExecutePlaySceneTask: exception {}", exception.what());
 				} catch(...) {
@@ -666,10 +617,7 @@ namespace Commands::SAFCommand
 
 				mgr->RequestGraphUpdate();
 
-				// Zamknij konsolę natychmiast z głównego wątku dla playscene
-				// (analogicznie do CloseConsoleMainThread wywoływanego z Input hooka).
 				CloseConsoleMainThread();
-				SAF_LOG_INFO("[TASK] ExecutePlaySceneTask: EXIT");
 			});
 	}
 
@@ -849,8 +797,6 @@ namespace Commands::SAFCommand
 		SafePrintLn(itfc, "saf optimize <file> [compression_level] - Optimizes GLTF to SAF");
 		SafePrintLn(itfc, "saf dumpbones [actorID] - Dumps actor 3D bone hierarchy to Data/SAF/Skeletons");
 		SafePrintLn(itfc, "saf offset2id <hex_rva> - Address Library: convert RVA (offset in exe) to ID for this game version. Example: saf offset2id 1A2B3C4D");
-		SafePrintLn(itfc, "saf rebind - Force Papyrus native function rebind (use if Papyrus animations fail after load).");
-		SafePrintLn(itfc, "saf resetsaveload - Clears stuck save-load flag (recovery if animations stop after a failed save load).");
 	}
 
 	RE::Actor* StrToActor(std::string_view a_str, bool a_verbose = true)
@@ -1129,29 +1075,6 @@ namespace Commands::SAFCommand
 
 		SAF_LOG_INFO("[MCF] Run: ENTRY - args.size()={}, fullString='{}'", a_args.size(), a_fullString ? a_fullString : "(null)");
 		itfc = a_intfc;
-		if (itfc) {
-			// Walidacja vtable przed wywołaniem wirtualnej metody
-			auto* vtable = *reinterpret_cast<void**>(itfc);
-			SAF_LOG_INFO("[SAF] itfc={}, vtable={}", static_cast<void*>(itfc), static_cast<void*>(vtable));
-			
-			// Sprawdź czy vtable jest w rozsądnym zakresie (wewnątrz MCF DLL)
-			auto mcfModule = GetModuleHandleA("ModernCommandFramework.dll");
-			if (mcfModule) {
-				auto mcfBase = reinterpret_cast<uintptr_t>(mcfModule);
-				auto mcfSize = 0x1000000; // 16MB - przybliżony rozmiar
-				auto vtableAddr = reinterpret_cast<uintptr_t>(vtable);
-				
-				if (vtableAddr < mcfBase || vtableAddr >= mcfBase + mcfSize) {
-					SAF_LOG_ERROR("[SAF] Invalid vtable address: {} (outside MCF DLL range {}-{})", 
-						reinterpret_cast<void*>(vtable), reinterpret_cast<void*>(mcfBase), reinterpret_cast<void*>(mcfBase + mcfSize));
-					return;
-				}
-			}
-			
-			// Pomiń PreventDefaultPrint() jeśli vtable jest podejrzana - problem w MCF
-			// TODO: Naprawić PreventDefaultPrint() w MCF
-			SAF_LOG_WARN("[SAF] Skipping PreventDefaultPrint() due to vtable corruption risk in MCF");
-		}
 		args = a_args;
 		fullStr = a_fullString;
 		SAF_LOG_INFO("[MCF] Run: variables set, itfc={}", static_cast<void*>(itfc));
@@ -1161,29 +1084,22 @@ namespace Commands::SAFCommand
 			if (itfc) ShowHelp();
 			RequestCloseConsole();
 			CloseConsoleMainThread();
-			SAF_LOG_INFO("[MCF] Run: EXIT (help shown)");
 			return;
 		}
 
 		try {
 			std::string cmd = Util::String::ToLower(std::string(ToSV(args[0])));
-			SAF_LOG_INFO("[MCF] Run: command='{}'", cmd);
 
-			// Komendy synchroniczne (help)
+			// Komendy synchroniczne (help) – mogą używać itfc
 			if (cmd == "help") {
-				SAF_LOG_INFO("[MCF] Run: handling 'help' command");
 				if (itfc) ShowHelp();
 				RequestCloseConsole();
 				CloseConsoleMainThread();
-				SAF_LOG_INFO("[MCF] Run: EXIT (help)");
 				return;
 			}
 
 			// Komendy asynchroniczne (play) – tylko dodaj do kolejki, NIE używaj itfc
 			if (cmd == "play") {
-				SAF_LOG_INFO("[MCF] Run: handling 'play' command");
-				// UX: close console immediately after Enter for `saf play ...`.
-				// Keep both direct close and flag fallback.
 				RequestCloseConsole();
 				CloseConsoleMainThread();
 
@@ -1191,20 +1107,16 @@ namespace Commands::SAFCommand
 				static auto lastRebindTime = std::chrono::steady_clock::now();
 				auto now = std::chrono::steady_clock::now();
 				if (now - lastRebindTime > std::chrono::seconds(30)) {
-					SAF_LOG_INFO("[MCF] Auto-rebinding Papyrus before play");
 					Papyrus::SAFScript::RebindAfterLoad();
 					lastRebindTime = now;
 				}
 
 				ProcessPlayCommand();
-				SAF_LOG_INFO("[MCF] Run: EXIT (play queued)");
 				return;
 			}
 
 			// saf playscene <refId1> <refId2> <file1> <file2> [speed]
-			// speed – opcjonalne, np. 1.0 (x1), 2.0 (x2); gdy brak, używana jest wartość z INI (PlaySceneSpeed).
 			if (cmd == "playscene") {
-				SAF_LOG_INFO("[MCF] Run: handling 'playscene' command");
 				if (args.size() < 5) {
 					SAF_LOG_WARN("[MCF] playscene: requires 4 arguments: refId1 refId2 file1 file2 [speed]");
 					if (itfc) {
@@ -1269,17 +1181,11 @@ namespace Commands::SAFCommand
 		}
 		if (cmd == "rebind") {
 			SAF_LOG_INFO("[MCF] Run: handling 'rebind' command (full reset)");
-			// 1. Przywróć kości aktorom i wyczyść cały stan sesji
 			Animation::GraphManager::GetSingleton()->Reset(true);
-			// 2. Wyczyść rejestr custom bones
 			Animation::NIFBoneManager::ClearCustomBones();
-			// 3. Reset EventManager
 			Papyrus::EventManager::GetSingleton()->Reset();
-			// 4. Reset Face::Manager
 			Animation::Face::Manager::GetSingleton()->Reset();
-			// 5. Rebinduj Papyrus native functions
 			Papyrus::SAFScript::RebindAfterLoad();
-			// 6. Wyczyść overridy i aliasy
 			{
 				std::lock_guard<std::mutex> lock(g_animOverrideMutex);
 				g_animOverrideMap.clear();
@@ -1287,7 +1193,6 @@ namespace Commands::SAFCommand
 			g_aliasToKey.clear();
 			g_aliasesInitialized.store(false, std::memory_order_release);
 			g_overridesLoaded.store(false, std::memory_order_release);
-			// 7. Wyczyść kolejki odroczonych zleceń
 			{
 				std::lock_guard<std::mutex> lock(g_pendingMutex);
 				while (!g_pendingPlay.empty()) g_pendingPlay.pop();
@@ -1295,24 +1200,11 @@ namespace Commands::SAFCommand
 				g_processRequested.store(false, std::memory_order_release);
 			}
 			ClearPendingDump();
-			// 8. Wyczyść zapamiętane referencje
 			lastActor = nullptr;
 			lastFile.clear();
-			// 9. Wyczyść flagę saveload
 			Animation::GraphManager::GetSingleton()->SetSaveLoadInProgress(false);
 			if (itfc)
 				SafePrintLn(itfc, "SAF: Full reset complete (bones restored, state cleared, Papyrus rebound).");
-			RequestCloseConsole();
-			CloseConsoleMainThread();
-			return;
-		}
-		if (cmd == "resetsaveload") {
-			SAF_LOG_INFO("[MCF] Run: handling 'resetsaveload' command");
-			if (auto* mgr = Animation::GraphManager::GetSingleton()) {
-				mgr->SetSaveLoadInProgress(false);
-				if (itfc)
-					SafePrintLn(itfc, "SAF: save-load flag cleared.");
-			}
 			RequestCloseConsole();
 			CloseConsoleMainThread();
 			return;
@@ -1532,12 +1424,7 @@ namespace Commands::SAFCommand
 		// Szybkie sprawdzenie atomowej flagi - jeśli false, nie ma zleceń, wyjdź szybko
 		if (!g_hasPendingCommands.load(std::memory_order_acquire)) {
 			g_processRequested.store(false, std::memory_order_release);
-			static std::atomic<uint32_t> emptyCount{ 0 };
-			uint32_t emptyNum = ++emptyCount;
-			if (emptyNum <= 10 || emptyNum % 60 == 0) {
-				SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: no pending flag set, returning (call #{})", emptyNum);
-			}
-			return;  // Brak zleceń, nie blokuj mutexa
+			return;
 		}
 
 		static std::atomic<uint32_t> callCount{ 0 };
@@ -1548,20 +1435,9 @@ namespace Commands::SAFCommand
 		ss << std::this_thread::get_id();
 		std::string threadIdStr = ss.str();
 		
-		// Log pierwsze 10 wywołań, potem co 60
-		if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: ENTRY (call #{}, thread_id={})", callNum, threadIdStr);
-		}
-		
 		std::queue<PendingPlay> batch;
-		size_t queueSizeBefore = 0;
 		{
-			if (callNum <= 10 || callNum % 60 == 0) {
-				SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: acquiring lock (call #{}, thread_id={})", callNum, threadIdStr);
-			}
 			std::lock_guard<std::mutex> lock(g_pendingMutex);
-			queueSizeBefore = g_pendingPlay.size();
-			// Ograniczenie na jedną klatkę – zapobiega zawieszce przy .bat / wielu komendach
 			size_t toTake = (std::min)(g_pendingPlay.size(), kMaxPendingCommandsPerFrame);
 			for (size_t i = 0; i < toTake && !g_pendingPlay.empty(); ++i) {
 				batch.push(std::move(g_pendingPlay.front()));
@@ -1570,42 +1446,28 @@ namespace Commands::SAFCommand
 			if (g_pendingPlay.empty()) {
 				g_hasPendingCommands.store(false, std::memory_order_release);
 			}
-			if (callNum <= 10 || callNum % 60 == 0 || batch.size() > 0) {
-				SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: took {} from queue ({} left), batch size: {} (call #{})", toTake, g_pendingPlay.size(), batch.size(), callNum);
-			}
-		}
-		if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: lock released (call #{})", callNum);
 		}
 
 		if (batch.empty()) {
-			if (callNum <= 10 || callNum % 60 == 0) {
-				SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: no commands in local batch to process (call #{})", callNum);
-			}
 			return;
 		}
 
-		// Przy pierwszej komendzie przeładuj szkelety – przy PostDataLoad lista ras bywa pusta w Starfield
+		// Przy pierwszej komendzie przeładuj szkelety
 		static std::once_flag s_skeletonsReloadedForForms;
 		std::call_once(s_skeletonsReloadedForForms, []() {
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: reloading skeletons (form list now available for ModelDB)");
 			Settings::LoadBaseSkeletons();
 		});
 
 		size_t batchSize = batch.size();
-		SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: processing {} commands from local batch (call #{})", batchSize, callNum);
 
 		size_t processed = 0;
 		while (!batch.empty()) {
 			processed++;
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: processing command {}/{} from batch (call #{})", processed, batchSize, callNum);
 			
 			auto cmd = std::move(batch.front());
 			batch.pop();
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: cmd.path='{}', cmd.actorId='{}'", cmd.path, cmd.actorId);
 
 			RE::Actor* actor = GetActorByRefID(cmd.actorId);
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: actorId='{}' -> actor={}", cmd.actorId, static_cast<void*>(actor));
 
 			if (!actor) {
 				SAF_LOG_WARN("[PROCESS] ProcessPendingCommands: actor not found, skipping command");
@@ -1617,19 +1479,10 @@ namespace Commands::SAFCommand
 			}
 
 			auto resolvedKey = ResolveOverridePath(cmd.path);
-			if (resolvedKey != cmd.path) {
-				SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: override '{}' -> '{}'", cmd.path, resolvedKey);
-			}
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: resolving path for '{}'", resolvedKey);
 			auto resolvedPath = ResolveAnimationPathWithFallback(resolvedKey);
 			std::string pathStr = resolvedPath.string();
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: resolved path='{}', animIndex={}", pathStr, cmd.animIndex);
 
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: calling GraphManager::GetSingleton()");
 			auto* mgr = Animation::GraphManager::GetSingleton();
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: GraphManager={}", static_cast<void*>(mgr));
-			
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: calling LoadAndStartAnimation(actor={}, path='{}', animIndex={})", static_cast<void*>(actor), pathStr, cmd.animIndex);
 			bool ok = false;
 			try {
 				ok = mgr->LoadAndStartAnimation(actor, pathStr, true, cmd.animIndex);
@@ -1638,30 +1491,22 @@ namespace Commands::SAFCommand
 			} catch (...) {
 				SAF_LOG_ERROR("[PROCESS] ProcessPendingCommands: unknown exception");
 			}
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: LoadAndStartAnimation returned");
 			if (!ok && itfc) {
 				const std::string& err = Animation::GraphManager::GetLastLoadError();
 				if (!err.empty())
 					SafePrintLn(itfc, "SAF: " + err);
 			}
 			if (mgr) {
-				SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: requesting graph update");
 				mgr->RequestGraphUpdate();
 			}
 			
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: calling SetLastAnimInfo");
 			SetLastAnimInfo(pathStr, actor);
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: SetLastAnimInfo returned");
-			
-			SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: command {}/{} completed successfully", processed, batchSize);
 		}
 		
 		// Wyczyść flagę jeśli wszystkie zlecenia zostały przetworzone
 		g_hasPendingCommands.store(false, std::memory_order_release);
 		g_processRequested.store(false, std::memory_order_release);
 		
-		SAF_LOG_INFO("[PROCESS] ProcessPendingCommands: EXIT - processed {}/{} commands", processed, batchSize);
-
 		// Zamknij konsolę po wykonaniu komendy (jesteśmy na głównym wątku).
 		if (processed > 0) {
 			if (auto* mgr = Animation::GraphManager::GetSingleton(); mgr && mgr->IsMainThread()) {
@@ -1678,13 +1523,11 @@ namespace Commands::SAFCommand
 	void RequestProcessPending()
 	{
 		g_processRequested.store(true, std::memory_order_release);
-		SAF_LOG_INFO("[PROCESS] RequestProcessPending: flag set");
 	}
 
 	void RequestCloseConsole()
 	{
 		g_closeConsoleRequested.store(true, std::memory_order_release);
-		SAF_LOG_INFO("[UI] RequestCloseConsole: flag set");
 	}
 
 	bool ConsumeProcessRequest()
@@ -1736,7 +1579,6 @@ namespace Commands::SAFCommand
 				return;
 			}
 
-			SAF_LOG_INFO("[DUMP] ProcessPendingDump: ENTRY");
 			PendingDump job;
 			{
 				std::lock_guard<std::mutex> lock(g_dumpMutex);
