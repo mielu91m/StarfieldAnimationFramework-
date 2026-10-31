@@ -53,10 +53,13 @@ namespace Animation
 		std::shared_ptr<IAnimationFile> DemandAnimation(const FileID& a_id, std::string_view a_skeleton, bool a_noBlendGraphs);
 		void OnAnimationDestroyed(IAnimationFile* a_anim);
 		void GetAllLoadedAnimations(std::vector<std::pair<AnimID, std::weak_ptr<IAnimationFile>>>& a_animsOut);
+		/// Hard reset: drop all pending requests and cached loaded animations.
+		/// Animations still held by active graphs survive until released, but new loads start fresh.
+		void ClearCache();
 
 	protected:
 		void ProcessRequests();
-		void DoProcessRequests();
+		void DoProcessRequests(std::stop_token stopToken);
 		std::shared_ptr<Procedural::PGraph> DoLoadBlendGraph(const AnimID& a_id);
 		std::shared_ptr<IBasicAnimation> DoLoadAnimation(const AnimID& a_id);
 		std::shared_ptr<IAnimationFile> GetLoadedAnimation(const AnimID& a_id);
@@ -68,7 +71,7 @@ namespace Animation
 
 	private:
 		std::jthread _workerThread;
-		std::condition_variable _workCV;
+		std::condition_variable_any _workCV;
 		std::mutex _reqMutex;
 		std::list<RequestData> _requests;
 		std::mutex _loadedMutex;

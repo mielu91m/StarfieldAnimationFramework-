@@ -1,10 +1,15 @@
 #include "PCH.h"
 #include <array>
+#include <algorithm>
 #include "Animation/GraphManager.h"
 #include "Commands/SAFCommand.h"
 #include "Papyrus/EventManager.h"
+#include "Papyrus/SAFScript.h"
+#include "Animation/Face/Manager.h"
 #include "Tasks/Input.h"
 #include "Serialization/GLTFImport.h"
+#include "Animation/FBXAnimationFile.h"
+#include "Animation/FBX/FBXGraphManager.h"
 #include "Settings/Settings.h"
 #include "Animation/ClipGenerator.h"
 #include "Util/String.h"
@@ -13,8 +18,12 @@
 #include "RE/N/NiTransform.h"
 #include "RE/N/NiUpdateData.h"
 #include "RE/T/TESObjectREFR.h"
+#include "RE/T/TESForm.h"
 #include "RE/B/BSAnimationGraph.h"
+#include "RE/B/BGSModelNode.h"
+#include "RE/B/BSFadeNode.h"
 #include "RE/IDs_VTABLE.h"
+#include "SFSE/API.h"
 #include "RE/E/Events.h"
 #include "RE/IDs.h"
 #include "RE/I/IAnimationGraphManagerHolder.h"
@@ -97,7 +106,37 @@ static std::atomic<bool> g_taskLoopStarted{ false };
 static std::atomic<bool> g_taskLoopAssumeMainThread{ false };
 static std::atomic<bool> g_taskLoopAllowDump{ false };
 static std::atomic<bool> g_taskLoopAllowUpdateGraphs{ false };
-static std::atomic<bool> g_playerUpdateEventEnabled{ true };
+	// 1 = log [FRAMEDUMP] w UpdateGraphs (kosztowne formatowanie); domyślnie wyłączone.
+	static std::atomic<bool> g_updateGraphsVerboseFrameDump{ false };
+	// 1 = task też woła UpdateGraphs gdy hook już działa (podwójne dt = przeskoki). 0 = tylko dopóki hook nie był widziany.
+	static std::atomic<bool> g_taskDuplicateUpdateWithHook{ false };
+	// 1 = instaluj hooki trampolinowe (AnimGraphManagerCall/GraphUpdate) NAWET gdy pętla
+	// zadaniowa jest aktywna. W zwykłej rozgrywce silnik aplikuje swoją animację PO
+	// flushu zadań (zapis SAF przegrywa), a hook managera animacji odpala się per aktor
+	// w fazie animacji silnika — nasz zapis ląduje po jego nadpisaniu (jak w NAF).
+	// Pętla zadaniowa zostaje jako druga pompa (m.in. tryb foto, gdzie hooki milczą).
+	static std::atomic<bool> g_animHooksWithTaskLoop{ false };
+	// 1 = stampuj pozę SAF do bufora rig (BGSModelNode->rig->local->data) w hooku compose
+	// (BGSModelNode::Update, vtable slot 2) — deterministyczny punkt zapisu TUŻ przed
+	// compose+commit silnika (mechanizm z osf-animation). Bez tego w zwykłej rozgrywce
+	// silnik nadpisuje animację po flushu zadania (efekt: działa tylko w trybie foto).
+	static std::atomic<bool> g_composeStampPose{ true };
+	static std::atomic<bool> g_playerUpdateEventEnabled{ true };
+	// ── WATCHDOG zapobiegania "zamrożonym/trzęsącym się" animacjom ────────────
+	// Wykrywa zatrzymaną pętlę UpdateGraphs: grafy aktywne, ale przez dłuższy czas
+	// nie było ani jednego pompowania (zablokowany task loop / mutex / flaga
+	// save-load). Objaw: aktorzy stoją w półpozie i drżą (gra nadpisuje kości,
+	// a SAF nie utrzymuje pozy). Watchdog ostrzega i po dłuższym czasie twardo
+	// zrywa zawieszone animacje, żeby aktorzy wrócili pod kontrolę gry.
+	static std::atomic<bool> g_updateWatchdogEnabled{ true };
+	static std::atomic<float> g_updateWatchdogTimeoutSeconds{ 5.0f };       // po tym czasie ostrzeżenie + próba naprawy
+	static std::atomic<float> g_updateWatchdogForceReleaseSeconds{ 15.0f }; // po tym czasie twarde przerwanie animacji
+	static std::atomic<uint32_t> g_saveLoadAutoClearSeconds{ 15 };          // auto-clear zablokowanej flagi save-load (było sztywne 30 s)
+	// Heartbeat: moment ostatniego faktycznego UpdateGraphs (gdy grafy aktywne),
+	// w nanosekundach steady_clock (atomic – aktualizowany też z wątku Papyrus przy attachu).
+	static std::atomic<std::int64_t> g_lastGraphUpdateNs{ 0 };
+	static std::atomic<bool> g_watchdogStallLogged{ false };
+	static std::atomic<std::int64_t> g_watchdogStallStartNs{ 0 };
 static std::atomic<std::uint32_t> g_updateSceneRectEventRva{ 0 };
 static std::atomic<std::uint32_t> g_playerUpdateEventRva{ 0 };
 static std::atomic<std::uint32_t> g_animGraphUpdateRva{ 0 };
@@ -123,6 +162,11 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 	// 1 = NAF-like apply: ignoruj rest/game_base, użyj bezpośrednio macierzy z animacji (jak Graph::PushAnimationOutput w NAF).
 	// Zakładamy, że animacja jest już w tym samym układzie co szkielet gry (Z-up). Domyślnie bez YUpToZUpConversion.
 	static std::atomic<bool> g_useNAFApplyMode{ false };
+	// UseNAFApplyMode: rotacja z klipu zwykle jako ortonormalna; zła skala kanału (GLTF) potrafi „spłaszczyć” cały szkielet.
+	// true = przy zapisie NAF pomijamy skalowanie z klipu (s=1 przy mnożeniu kolumn rotacji).
+	static std::atomic<bool> g_naFForceUnitBoneScale{ true };
+	// Rozpakowany SOA→joint: doprowadź quat do jednostki (inne → macierze nic nieregularne × zła skala = deformacja siatki).
+	static std::atomic<bool> g_normalizeUnpackQuaternions{ true };
 	// 1 = pozwól animacji sterować kośćmi twarzy (Eye/Jaw/faceBone_*). 0 = zostaw pod grą (FaceGen/morphy).
 	static std::atomic<bool> g_animateFaceJoints{ true };  // default on: face bones animated with blend so they don't disappear
 	// Siła miksu twarzy: 0.0 = tylko gra, 1.0 = tylko animacja, wartości pośrednie = blend.
@@ -132,6 +176,29 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 	static std::vector<std::string> g_breastHairJoints;
 	static std::mutex g_physicsJointsMutex;
 	static std::mutex g_breastHairJointsMutex;
+	// PreserveBones: kości w 100% pod kontrolą gry (SAF ich nie pisze).
+	// Lista substringów nazw z INI. Dla kości wtórnej fizyki/jiggle (włosy,
+	// piersi, jądra) SAF i silnik piszą ten sam local co klatkę → kość „walczy”
+	// (drga/przyspiesza) szczególnie na meblach. Gdy SAF przestaje je ruszać,
+	// zostają wyłącznie grze i ruch jest stabilny.
+	static std::vector<std::string> g_preserveJoints;
+	static std::mutex g_preserveJointsMutex;
+	// BoneWatch: diagnostyka. Lista substringów nazw kości; co N klatek loguje
+	// [BONEREF] obrót locala węzła (dq) oraz różnicę względem wartości, którą SAF
+	// zapisał w poprzedniej klatce (eng) → pokazuje, czy silnik „walczy” z SAF o
+	// tę samą kość (duże eng = silnik nadpisuje nasz zapis).
+	static std::vector<std::string> g_boneWatchJoints;
+	static std::mutex g_boneWatchJointsMutex;
+	static std::atomic<int> g_boneWatchInterval{ 30 };
+	// AnchorCapsuleMode: model OSF (osf-animation) dla zakotwiczonych scen.
+	// 1 = kapsuła Havok aktora (czytana przez render cull) jest przenoszona na
+	//     kotwicę RAZ przy attachu (Actor::SetPosition(pos,true)) i aktor jest
+	//     trzymany WYŁĄCZNIE przez boolFlags2 kAnimationDriven (re-assert co 18
+	//     klatek). Bez pinowania wizualnego roota/data.location i bez wymuszania
+	//     yaw co klatkę — to walczy z silnikiem i powoduje drgania/przeskoki
+	//     („ucieczka" z mebla). Gracz (0x14) zawsze pomijany.
+	// 0 = stary tryb SAF: pin wizualnego roota + data.location/angle + yaw.
+	static std::atomic<bool> g_anchorCapsuleMode{ true };
 	// Prędkość odtwarzania animacji w saf playscene (1.0 = domyślna, 2.0 = dwukrotnie szybciej).
 	static std::atomic<float> g_playSceneSpeed{ 1.0f };
 	// 0 = off, 1..4 = prosta poprawka osi dla kręgosłupa i nóg (Spine/Legs) po wyliczeniu macierzy:
@@ -143,7 +210,7 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 	// 1 = użyj jako rest pose transformów odczytanych z aktora przy budowaniu joint map (bez ModelDB).
 	static std::atomic<bool> g_useActorRestPose{ false };
 	static std::atomic<bool> g_useModelDBForRestPose{ false };
-	static std::atomic<std::uint64_t> g_modelDBGetEntryID{ 949826 };  // Address Library ID GetEntry
+	static std::atomic<std::uint64_t> g_modelDBGetEntryID{ 183072 };  // Address Library ID GetEntry (NAF-style; 949826 invalid for 1.16.244 -> freeze)
 		static std::atomic<std::uint64_t> g_modelDBDecRefID{ 36741 };    // Address Library ID DecRef (albo użyj ModelDBDecRefRVA)
 		static std::atomic<std::uint32_t> g_modelDBDecRefRVA{ 0 };       // gdy nie 0: adres DecRef = base+RVA (IDA); wtedy drugie ID niepotrzebne
 	// 1 = only apply to joints where anim != rest (skip identity delta). Reduces deformation from overwriting all bones.
@@ -205,6 +272,71 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 		return a_default;
 	}
 
+	// Data/SAF/RootOffsets.ini: "<fragment ścieżki klipu>=x,y,z" w jednej linii.
+	// Zwraca XYZ do DODANIA do celu pinu dla aktorów grających pasujący klip
+	// (wyrównanie aktów wypieczonych na inną wysokość/mebel bez ruszania kości).
+	// Pierwsze dopasowanie wygrywa; brak pliku = same zera.
+	static void LoadRootOffsetForClip(const std::string& a_clipPath, float& a_x, float& a_y, float& a_z)
+	{
+		a_x = a_y = a_z = 0.f;
+		try {
+			const auto iniPath = Util::String::GetDataPath() / "SAF" / "RootOffsets.ini";
+			std::ifstream file(iniPath);
+			if (!file.is_open()) {
+				return;
+			}
+			const std::string clipLower = Util::String::ToLower(a_clipPath);
+			std::string line;
+			while (std::getline(file, line)) {
+				if (auto c = line.find_first_of(";#"); c != std::string::npos) {
+					line.erase(c);
+				}
+				const auto eq = line.find('=');
+				if (eq == std::string::npos) {
+					continue;
+				}
+				const std::string key = Trim(std::string_view(line).substr(0, eq));
+				const std::string val = Trim(std::string_view(line).substr(eq + 1));
+				if (key.empty() || val.empty()) {
+					continue;
+				}
+				if (clipLower.find(Util::String::ToLower(key)) == std::string::npos) {
+					continue;
+				}
+				float v[3] = { 0.f, 0.f, 0.f };
+				size_t pos = 0;
+				bool ok = true;
+				for (int k = 0; k < 3; ++k) {
+					const size_t comma = val.find(',', pos);
+					const std::string part = (comma == std::string::npos) ? val.substr(pos) : val.substr(pos, comma - pos);
+					auto f = Util::String::StrToFloat(Trim(part));
+					if (!f) {
+						ok = false;
+						break;
+					}
+					v[k] = *f;
+					if (comma == std::string::npos) {
+						if (k < 2) {
+							ok = false;
+						}
+						break;
+					}
+					pos = comma + 1;
+				}
+				if (!ok) {
+					continue;
+				}
+				a_x = v[0];
+				a_y = v[1];
+				a_z = v[2];
+				SAF_LOG_INFO("RootOffset: clip '{}' matched '{}' -> ({:.2f},{:.2f},{:.2f})",
+					a_clipPath, key, a_x, a_y, a_z);
+				return;
+			}
+		} catch (...) {
+		}
+	}
+
 	static void LoadHookOverrideFromIni()
 	{
 		if (g_hookOverrideLoaded.load(std::memory_order_acquire)) {
@@ -256,6 +388,56 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 			const bool enabled = ParseBool(value, false);
 			g_taskLoopAllowUpdateGraphs.store(enabled, std::memory_order_release);
 			SAF_LOG_INFO("TaskUpdateLoop allow UpdateGraphs: {}", enabled ? "true" : "false");
+		} else if (key == "TaskDuplicateUpdateWithHook") {
+			const bool enabled = ParseBool(value, false);
+			g_taskDuplicateUpdateWithHook.store(enabled, std::memory_order_release);
+			SAF_LOG_INFO("TaskDuplicateUpdateWithHook: {} (1=task+hook both call UpdateGraphs; can jerk; 0=prefer single path)", enabled ? "true" : "false");
+		} else if (key == "AnimationHooksWithTaskLoop") {
+			const bool enabled = ParseBool(value, false);
+			g_animHooksWithTaskLoop.store(enabled, std::memory_order_release);
+			SAF_LOG_INFO("AnimationHooksWithTaskLoop: {} (1=install AnimGraphManagerCall/GraphUpdate trampoline hooks alongside the permanent task loop; fixes normal gameplay where the engine applies its animation after the task flush)", enabled ? "true" : "false");
+		} else if (key == "ComposeStampPose") {
+			const bool enabled = ParseBool(value, true);
+			g_composeStampPose.store(enabled, std::memory_order_release);
+			SAF_LOG_INFO("ComposeStampPose: {} (1=stamp SAF pose into BGSModelNode rig buffer at compose time — deterministic write point before the engine's compose+commit, OSF-style; 0=node->local writes only)", enabled ? "true" : "false");
+		} else if (key == "EnableUpdateWatchdog") {
+			const bool enabled = ParseBool(value, true);
+			g_updateWatchdogEnabled.store(enabled, std::memory_order_release);
+			SAF_LOG_INFO("UpdateWatchdog enabled: {} (1=detect+recover stuck/frozen animations; 0=off)", enabled ? "true" : "false");
+		} else if (key == "UpdateWatchdogTimeoutSeconds") {
+			try {
+				float v = std::stof(std::string(Trim(value)));
+				if (v < 0.5f) v = 0.5f;
+				if (v > 120.0f) v = 120.0f;
+				g_updateWatchdogTimeoutSeconds.store(v, std::memory_order_release);
+				SAF_LOG_INFO("UpdateWatchdogTimeoutSeconds: {} (warn+attempt recovery after this many seconds with no graph updates)", v);
+			} catch (...) {
+				SAF_LOG_WARN("UpdateWatchdogTimeoutSeconds invalid in ini: {}", value);
+			}
+		} else if (key == "UpdateWatchdogForceReleaseSeconds") {
+			try {
+				float v = std::stof(std::string(Trim(value)));
+				if (v < 1.0f) v = 1.0f;
+				if (v > 300.0f) v = 300.0f;
+				g_updateWatchdogForceReleaseSeconds.store(v, std::memory_order_release);
+				SAF_LOG_INFO("UpdateWatchdogForceReleaseSeconds: {} (hard-cancel stuck animations after this many seconds of stall)", v);
+			} catch (...) {
+				SAF_LOG_WARN("UpdateWatchdogForceReleaseSeconds invalid in ini: {}", value);
+			}
+		} else if (key == "SaveLoadAutoClearSeconds") {
+			try {
+				uint32_t v = static_cast<uint32_t>(std::stoul(std::string(Trim(value)), nullptr, 0));
+				if (v < 3) v = 3;
+				if (v > 300) v = 300;
+				g_saveLoadAutoClearSeconds.store(v, std::memory_order_release);
+				SAF_LOG_INFO("SaveLoadAutoClearSeconds: {} (auto-clear stuck save-load flag after this many seconds)", v);
+			} catch (...) {
+				SAF_LOG_WARN("SaveLoadAutoClearSeconds invalid in ini: {}", value);
+			}
+		} else if (key == "UpdateGraphsVerboseFrameDump") {
+			const bool enabled = ParseBool(value, false);
+			g_updateGraphsVerboseFrameDump.store(enabled, std::memory_order_release);
+			SAF_LOG_INFO("UpdateGraphs verbose frame dump: {}", enabled ? "true" : "false");
 		} else if (key == "EnablePlayerUpdateEvent") {
 			const bool enabled = ParseBool(value, true);
 			g_playerUpdateEventEnabled.store(enabled, std::memory_order_release);
@@ -361,6 +543,53 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 				g_breastHairJoints = std::move(substrings);
 			}
 			SAF_LOG_INFO("BreastHairJoints: {} entries (leave under game control to avoid furniture distortions)", g_breastHairJoints.size());
+		} else if (key == "PreserveBones") {
+			std::vector<std::string> substrings;
+			std::string v(Trim(value));
+			if (!v.empty()) {
+				for (size_t start = 0; start < v.size(); ) {
+					size_t comma = v.find(',', start);
+					std::string part = (comma == std::string::npos) ? v.substr(start) : v.substr(start, comma - start);
+					part = Trim(part);
+					if (!part.empty()) substrings.push_back(part);
+					start = (comma == std::string::npos) ? v.size() : comma + 1;
+				}
+			}
+			{
+				std::lock_guard<std::mutex> lock(g_preserveJointsMutex);
+				g_preserveJoints = std::move(substrings);
+			}
+			SAF_LOG_INFO("PreserveBones: {} entries (SAF never writes these joints - game owns them; fixes jiggle bones fighting on furniture)", g_preserveJoints.size());
+		} else if (key == "BoneWatch") {
+			std::vector<std::string> substrings;
+			std::string v(Trim(value));
+			if (!v.empty()) {
+				for (size_t start = 0; start < v.size(); ) {
+					size_t comma = v.find(',', start);
+					std::string part = (comma == std::string::npos) ? v.substr(start) : v.substr(start, comma - start);
+					part = Trim(part);
+					if (!part.empty()) substrings.push_back(part);
+					start = (comma == std::string::npos) ? v.size() : comma + 1;
+				}
+			}
+			{
+				std::lock_guard<std::mutex> lock(g_boneWatchJointsMutex);
+				g_boneWatchJoints = std::move(substrings);
+			}
+			SAF_LOG_INFO("BoneWatch: {} entries (diagnostic [BONEREF] log: node local vs last SAF-written value)", g_boneWatchJoints.size());
+		} else if (key == "BoneWatchInterval") {
+			try {
+				int v = std::stoi(std::string(Trim(value)));
+				if (v < 1) v = 1;
+				g_boneWatchInterval.store(v, std::memory_order_release);
+				SAF_LOG_INFO("BoneWatchInterval: {} frames", v);
+			} catch (...) {
+				SAF_LOG_WARN("BoneWatchInterval invalid in ini: {}", value);
+			}
+		} else if (key == "AnchorCapsuleMode") {
+			const bool enabled = ParseBool(value, true);
+			g_anchorCapsuleMode.store(enabled, std::memory_order_release);
+			SAF_LOG_INFO("AnchorCapsuleMode: {} (1=OSF-style: capsule moved to anchor once + kAnimationDriven only; 0=old SAF visual-root pin + yaw force)", enabled ? "true" : "false");
 		} else if (key == "PlaySceneSpeed") {
 			try {
 				float v = std::stof(std::string(Trim(value)));
@@ -391,6 +620,20 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 			const bool enabled = ParseBool(value, false);
 			g_useNAFApplyMode.store(enabled, std::memory_order_release);
 			SAF_LOG_INFO("UseNAFApplyMode: {} (1=NAF-like: bez rest/game_base, czysta macierz z animacji jak w NAF Graph::PushAnimationOutput; GLTF musi być w Z-up)", enabled ? "true" : "false");
+		} else if (key == "DefaultSkeleton") {
+			std::string skeletonName = Trim(value);
+			if (!skeletonName.empty()) {
+				Settings::SetDefaultSkeleton(skeletonName);
+				SAF_LOG_INFO("DefaultSkeleton: {} (fallback for races without their own skeleton file)", skeletonName);
+			}
+		} else if (key == "NAFForceUnitScale") {
+			const bool enabled = ParseBool(value, true);
+			g_naFForceUnitBoneScale.store(enabled, std::memory_order_release);
+			SAF_LOG_INFO("NAFForceUnitScale: {} (1=zapis NAF używa s=1; 0=stosuj scale z klipu – ryzyko spłaszczania jeśli skala lub quat są złe)", enabled ? "true" : "false");
+		} else if (key == "NormalizeKeyframesQuaternions") {
+			const bool enabled = ParseBool(value, true);
+			g_normalizeUnpackQuaternions.store(enabled, std::memory_order_release);
+			SAF_LOG_INFO("NormalizeKeyframesQuaternions: {} (1=jednostka quat przy Unpack SOA)", enabled ? "true" : "false");
 		} else if (key == "SpineLegsSimpleAxisFix") {
 			try {
 				int v = std::stoi(std::string(Trim(value)));
@@ -421,7 +664,7 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 			try {
 				std::uint64_t id = static_cast<std::uint64_t>(std::stoull(std::string(Trim(value)), nullptr, 0));
 				g_modelDBGetEntryID.store(id, std::memory_order_release);
-				SAF_LOG_INFO("ModelDBGetEntryID: {} (0=użyj domyślnego 949826)", id);
+				SAF_LOG_INFO("ModelDBGetEntryID: {} (0=użyj domyślnego 183072)", id);
 			} catch (...) {
 				SAF_LOG_WARN("ModelDBGetEntryID: invalid value '{}'", value);
 			}
@@ -631,6 +874,7 @@ static std::atomic<bool> g_rebindOnNextHook{ false };
 static std::atomic_flag g_updateGuard = ATOMIC_FLAG_INIT;
 static std::atomic<bool> g_forceUpdate{ false };
 static std::atomic<bool> g_hookSeen{ false };
+static std::atomic<bool> g_saveLoadInProgress{ false };
 // VTable hooks currently unstable; keep disabled for now.
 static std::atomic<bool> g_allowVtableHooks{ false };
 
@@ -650,6 +894,64 @@ static bool ReadAnimUpdateData(void* a_updateData, float& a_outDelta, bool& a_ou
 	a_outDelta = dt;
 	a_outModelCulled = (culledByte != 0);
 	return true;
+}
+
+// Sprawdza, czy cały zakres [a_ptr, a_ptr+a_size) leży w commitowanej, czytelnej pamięci.
+// Używane w hookach, których wskaźniki argumentów pochodzą z call site znalezionego
+// skanem (offset mógł się przesunąć między wersjami gry) - chroni przed odczytem
+// spod śmieciowego wskaźnika (crash) i pozwala bezpiecznie spaść na dt z zegara.
+static bool IsReadableRange(const void* a_ptr, std::size_t a_size)
+{
+	if (!a_ptr || a_size == 0) {
+		return false;
+	}
+	uintptr_t addr = reinterpret_cast<uintptr_t>(a_ptr);
+	const uintptr_t end = addr + a_size;
+	while (addr < end) {
+		MEMORY_BASIC_INFORMATION mbi{};
+		if (VirtualQuery(reinterpret_cast<const void*>(addr), &mbi, sizeof(mbi)) == 0) {
+			return false;
+		}
+		if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+			return false;
+		}
+		const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+		if (regionEnd <= addr) {
+			return false;
+		}
+		addr = regionEnd;
+	}
+	return true;
+}
+
+// Czy wskaźnik leży w module głównym (Starfield.exe). Skan CALL-a po bajcie 0xE8 może
+// trafić na fałszywy traf (bajt wewnątrz immediate innej instrukcji) - wtedy rel32
+// prowadzi w śmieci i detour wołający "oryginał" crashuje od pierwszego wywołania.
+static bool IsInMainModule(const void* a_ptr)
+{
+	if (!a_ptr) {
+		return false;
+	}
+	static uintptr_t s_base = 0;
+	static uintptr_t s_end = 0;
+	if (s_base == 0) {
+		const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+		if (!base) {
+			return false;
+		}
+		const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+			return false;
+		}
+		const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE) {
+			return false;
+		}
+		s_base = base;
+		s_end = base + nt->OptionalHeader.SizeOfImage;
+	}
+	const uintptr_t p = reinterpret_cast<uintptr_t>(a_ptr);
+	return p >= s_base && p < s_end;
 }
 
 using BSAnimationGraphUpdateFunc = void (*)(RE::BSAnimationGraph*, RE::BSAnimationUpdateData&);
@@ -686,12 +988,31 @@ public:
 		if (g_hookSeen.load(std::memory_order_acquire)) {
 			return RE::BSEventNotifyControl::kContinue;
 		}
+		if (g_saveLoadInProgress.load(std::memory_order_acquire)) {
+			return RE::BSEventNotifyControl::kContinue;
+		}
+
+		// Jeśli główny krok SAF idzie przez TaskUpdateLoop → nie dublowanie z SceneRect (brak trampolin = g_hookSeen false).
+		if (g_taskLoopEnabled.load(std::memory_order_acquire) &&
+			g_taskLoopAllowUpdateGraphs.load(std::memory_order_acquire) &&
+			g_taskLoopStarted.load(std::memory_order_acquire)) {
+			return RE::BSEventNotifyControl::kContinue;
+		}
 
 		auto* mgr = GraphManager::GetSingleton();
 		const DWORD curThread = GetCurrentThreadId();
 		if (g_mainThreadId == 0) {
 			g_mainThreadId = curThread;
 			SAF_LOG_INFO("GraphManager: main thread id set to {} (UpdateSceneRectEvent)", g_mainThreadId);
+		}
+
+		// Sprawdzaj co 120 klatek czy trzeba rebindować Papyrus
+		static std::atomic<uint32_t> rebindCheckCounter{0};
+		if (++rebindCheckCounter % 120 == 0) {
+			if (Papyrus::SAFScript::NeedsRebind()) {
+				SAF_LOG_INFO("UpdateSceneRectEvent: VM changed - rebinding Papyrus");
+				Papyrus::SAFScript::RebindAfterLoad();
+			}
 		}
 
 		const bool isMainThread = (g_mainThreadId != 0 && curThread == g_mainThreadId);
@@ -752,12 +1073,33 @@ public:
 		if (g_hookSeen.load(std::memory_order_acquire)) {
 			return RE::BSEventNotifyControl::kContinue;
 		}
+		if (g_saveLoadInProgress.load(std::memory_order_acquire)) {
+			return RE::BSEventNotifyControl::kContinue;
+		}
+
+		// Jeśli główny krok SAF idzie przez TaskUpdateLoop → nie dublowanie z PlayerUpdate
+		// (brak trampolin = g_hookSeen false). Bez tego UpdateGraphs leciało 2x na klatkę
+		// (task loop + ten sink) – dodatkowe kroki napędzały fizykę jiggle (drgania/przyspieszenie).
+		if (g_taskLoopEnabled.load(std::memory_order_acquire) &&
+			g_taskLoopAllowUpdateGraphs.load(std::memory_order_acquire) &&
+			g_taskLoopStarted.load(std::memory_order_acquire)) {
+			return RE::BSEventNotifyControl::kContinue;
+		}
 
 		auto* mgr = GraphManager::GetSingleton();
 		const DWORD curThread = GetCurrentThreadId();
 		if (g_mainThreadId == 0) {
 			g_mainThreadId = curThread;
 			SAF_LOG_INFO("GraphManager: main thread id set to {} (PlayerUpdateEvent)", g_mainThreadId);
+		}
+
+		// Sprawdzaj co 120 klatek czy trzeba rebindować Papyrus
+		static std::atomic<uint32_t> rebindCheckCounter{0};
+		if (++rebindCheckCounter % 120 == 0) {
+			if (Papyrus::SAFScript::NeedsRebind()) {
+				SAF_LOG_INFO("PlayerUpdateEvent: VM changed - rebinding Papyrus");
+				Papyrus::SAFScript::RebindAfterLoad();
+			}
 		}
 
 		const bool isMainThread = (g_mainThreadId != 0 && curThread == g_mainThreadId);
@@ -858,14 +1200,36 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 
 	struct ActorGraphState
 	{
+		// Pre-kompilowane flagi typu kości — unikamy per-klatkowych string porównań w UpdateGraphs.
+		enum JointFlag : uint32_t {
+			kFlagNone          = 0,
+			kFlagFace          = 1 << 0,
+			kFlagMouthRegion   = 1 << 1,
+			kFlagBelly         = 1 << 2,
+			kFlagVaginaChain   = 1 << 3,
+			kFlagHand          = 1 << 4,
+			kFlagPhysics       = 1 << 5,   // IsPhysicsJoint — dynamiczna lista z INI
+			kFlagSpineOrLeg    = 1 << 6,
+			kFlagArmOrHand     = 1 << 7,
+			kFlagUpperArmOnly  = 1 << 8,
+			kFlagTorsoRef      = 1 << 9,
+			kFlagCalfOrFoot    = 1 << 10,
+			kFlagPreserve      = 1 << 11,  // PreserveBones/BreastHairJoints — 100% game control
+		};
 		std::shared_ptr<Animation::OzzSkeleton> skeleton;
 		std::unique_ptr<Animation::Generator> generator;
 		std::vector<RE::NiAVObject*> jointNodes;
 		// 1 if the current clip contains at least one TRS channel for this joint; 0 otherwise.
 		// Used to keep face bones stable when the animation doesn't animate them.
 		std::vector<std::uint8_t> jointHasChannel;
+		// Pre-kompilowane flagi typu kości (JointFlag bitmask) — obliczane raz przy budowie mapy,
+		// zamiast wołać IsFaceJoint/IsPhysicsJoint/etc. na każdej kości co klatkę.
+		std::vector<uint32_t> jointTypeFlags;
 		std::vector<Animation::Transform> localTransforms;
 		std::vector<Animation::Transform> restTransforms;       // OZZ bind-pose, or actor rest when UseActorRestPose
+		// Per-clip up-axis conversion (from ClipGenerator at attach). ANDed with
+		// the global ApplyYUpToZUpConversion switch when writing bones.
+		bool clipNeedsYUpToZUp = true;
 		std::vector<Animation::Transform> actorRestTransforms;  // captured from actor when building joint map (if UseActorRestPose)
 		std::vector<std::array<float,9>> gameBaseRotations;     // game's original bone rotation matrices, captured once
 		std::vector<std::array<float,3>> gameBaseTranslations;  // game's original bone translations, captured once
@@ -873,6 +1237,8 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		RE::NiAVObject* cachedActor3DRoot = nullptr;  // when 3D is recreated (e.g. after closing console), we must rebuild
 		bool loggedFirstUpdate = false;
 		bool jointMapBuildFailed = false;
+		// Po 3 kolejnych skanach refill bez nowych kości – przestań skanować (optymalizacja wydajności).
+		int refillEmptyScanCount = 0;
 		uint32_t animFrameCount = 0;
 		// NAF-style API state
 		std::string currentAnimationPath;
@@ -888,12 +1254,53 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		// 4) SAF.SetPositionLocked
 		float positionX = 0.0f, positionY = 0.0f, positionZ = 0.0f;
 		float angleX = 0.0f, angleY = 0.0f, angleZ = 0.0f;
+		// Per-plikowa korekta roota (Data/SAF/RootOffsets.ini, dopasowanie po
+		// podłańcuchu ścieżki klipu). Dodawana do celu pinu: pozwala wyrównać
+		// akty wypieczone na inną wysokość/mebel bez ruszania kości.
+		float rootOffsetX = 0.0f, rootOffsetY = 0.0f, rootOffsetZ = 0.0f;
+		// Czy kapsuła Havok została już dosadzona na pin (pierwszy pin po
+		// attachu). Dosadzana ponownie, gdy kotwica się zmieni (nowa animacja
+		// ma inną pozycję) — inaczej kapsuła zostawała na starym pinie, a
+		// wizualny root jechał do nowego → rozjazd i „naprawianie" kolizji z
+		// meblem (dodatkowe podkroki Havok → przyspieszony jiggle).
+		bool capsuleSeated = false;
+		float capsuleSeatX = 0.0f, capsuleSeatY = 0.0f, capsuleSeatZ = 0.0f;
+		// Jednorazowy [PIN] na klip: cel pinu vs faktyczny root/kapsuła/kąt.
+		bool pinDiagLogged = false;
 		// Backup flagów aktora używany przy LockActorForAnimation/UnlockActorAfterAnimation.
 		bool hadBoolBitsBackup = false;
 		REX::TEnumSet<RE::Actor::BOOL_BITS, std::uint32_t> backupBoolBits{};
 		bool hadBoolFlagsBackup = false;
 		REX::TEnumSet<RE::Actor::BOOL_FLAGS, std::uint32_t> backupBoolFlags{};
+		// Backup oryginalnego kąta i pozycji aktora sprzed animacji - przywracane w DetachGenerator.
+		// Zapobiega chodzeniu do tyłu po zakończeniu animacji (AI dostaje prawidłowy kąt).
+		bool hadAngleBackup = false;
+		float backupPosX = 0.0f, backupPosY = 0.0f, backupPosZ = 0.0f;
+		float backupAngleX = 0.0f, backupAngleY = 0.0f, backupAngleZ = 0.0f;
 		std::unordered_map<std::string, float> blendGraphVariables;
+		
+		// Stranded graph detection - steady-clock timestamp of last sample/update
+		// Note: not atomic to allow copy/move, updated under mutex
+		std::int64_t lastSampleMs = 0;
+
+		// ── Compose stamp (OSF-style) ─────────────────────────────────────────────
+		// Oprócz zapisu do node->local kopiujemy DOKŁADNIE te same 16 floatów (NiTransform)
+		// do płaskiego bufora rig->local->data w hooku BGSModelNode::Update (tuż przed
+		// compose+commit silnika). W zwykłej rozgrywce silnik nadpisuje animację PO flushu
+		// zadań — zapis node->local przegrywa; compose czyta bufor rig, więc ten zapis
+		// ZAWSZE trafia na ekran (zwykła gra i tryb foto).
+		RE::NiAVObject* stampFadeNode = nullptr;         // 3D root aktora (BSFadeNode) z chwili bindu
+		RE::BGSModelNode* stampModelNode = nullptr;      // BGSModelNode z chwili bindu
+		const void* stampLocalData = nullptr;            // rig->local->data z chwili bindu (identity check)
+		std::uint32_t stampNodeCount = 0;                // modelNode->nodes.size() z chwili bindu
+		std::uint16_t stampRigBoneCount = 0;             // u16 +0x78 z chwili bindu
+		int stampBindFailCount = 0;                      // ogranicznik ponownych prób bindu (retry po zmianie 3D)
+		std::vector<std::pair<std::uint16_t, std::uint16_t>> stampBinding;  // (jointIndex, rigIndex)
+		std::vector<std::array<float, 16>> stampPose;    // ostatnie 16 floatów zapisane do node->local per jointIndex
+		std::vector<std::uint8_t> stampValid;            // 1 = kość zastosowana w tej klatce
+		// Slot w g_stampSlots, do którego pompa publikuje niezmienną migawkę pozy
+		// (atomic<shared_ptr>) — compose czyta ją na wątkach silnika BEZ g_graphMutex.
+		std::size_t stampSlot = static_cast<std::size_t>(-1);
 	};
 
 	struct ActorSequenceState
@@ -904,10 +1311,19 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 	};
 
 	static std::unordered_map<RE::TESFormID, ActorGraphState> g_actorGraphs;
+	// Forward decl: definicja (wraz z g_stampSlots) stoi niżej, przy helperach stampu;
+	// StopAnimation używa jej przy usuwaniu grafu.
+	static void ReleaseStampSlot(ActorGraphState& a_state);
 	static std::unordered_map<RE::TESFormID, ActorSequenceState> g_actorSequenceState;
 	static std::unordered_map<RE::TESFormID, RE::TESFormID> g_syncOwner;  // actor formId -> owner formId (owner points to self)
 	struct SyncOwnerRoot { float px = 0, py = 0, pz = 0, ax = 0, ay = 0, az = 0; };
 	static std::unordered_map<RE::TESFormID, SyncOwnerRoot> g_syncOwnerRootCache;  // owner formId -> last applied position/angle (jak NAF rootTransform)
+	// Trwała kotwica per aktor (przeżywa DetachGenerator). Ustawiana autorytatywnie
+	// przez SetActorPosition/PrepareActorsForScene (Ebanex podaje współrzędne mebla)
+	// albo przy pierwszym pinie. Używana przy kolejnych ataczach, żeby animacje 2.+
+	// nie brały zdryfowanej pozycji z GetPosition (przez co aktor uciekał z mebla).
+	struct AnchorCache { float x = 0, y = 0, z = 0, ax = 0, ay = 0, az = 0; bool valid = false; bool authoritative = false; };
+	static std::unordered_map<RE::TESFormID, AnchorCache> g_anchorCache;
 	struct PendingLock { float x = 0, y = 0, z = 0; };
 	// Kąt (yaw) który ma być użyty w AttachGenerator zamiast GetAngle() – ustawiany przez PrepareActorsForScene.
 	// Gwarantuje poprawny state.angleZ niezależnie od tego co AI zrobi z data.angle między wywołaniami.
@@ -919,8 +1335,14 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		REX::TEnumSet<RE::Actor::BOOL_BITS,  std::uint32_t> bits{};
 		REX::TEnumSet<RE::Actor::BOOL_FLAGS, std::uint32_t> flags{};
 	};
+	struct PendingAngleBackup {
+		float posX = 0, posY = 0, posZ = 0;
+		float angX = 0, angY = 0, angZ = 0;
+	};
 	static std::unordered_map<RE::TESFormID, PendingLock>       g_pendingLockPosition;
 	static std::unordered_map<RE::TESFormID, PendingFlagBackup> g_pendingFlagBackup;
+	static std::unordered_map<RE::TESFormID, PendingAngleBackup> g_pendingAngleBackup;
+	static std::unordered_map<RE::TESFormID, int>               g_postAnimHeadingLock;  // actor → remaining frames with kHeadingFixed
 
 	/// Starfield: powiadom silnik o nowej pozycji refa (jak NAF TransformsManager::RequestPositionUpdate).
 	/// Wyłączone – ID 881086/149852 z NAF powodują EXCEPTION_ACCESS_VIOLATION przy Starfield 1.15.222 (inna Address Library).
@@ -1150,7 +1572,6 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		m[3]=2.f*(xy+wz);     m[4]=1.f-2.f*(xx+zz); m[5]=2.f*(yz-wx);
 		m[6]=2.f*(xz-wy);     m[7]=2.f*(yz+wx);    m[8]=1.f-2.f*(xx+yy);
 	}
-
 	// Y-up (GLTF) → Z-up for a 3x3 rotation matrix (same as in ApplyTransformRaw). Used for face-bone result.
 	static void ApplyYUpToZUpMatrix(const float m[9], float out[9])
 	{
@@ -1176,6 +1597,16 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 				out[6]=-m[3]; out[7]=-m[4]; out[8]=-m[5];
 			}
 		}
+	}
+
+	// Row-major 3×3 matrix multiply: out = a * b. Safe even if out aliases a or b.
+	static void Mat3Mul(const float a[9], const float b[9], float out[9])
+	{
+		float t[9];
+		for (int r = 0; r < 3; ++r)
+			for (int c = 0; c < 3; ++c)
+				t[r*3+c] = a[r*3+0]*b[c] + a[r*3+1]*b[3+c] + a[r*3+2]*b[6+c];
+		for (int i = 0; i < 9; ++i) out[i] = t[i];
 	}
 
 	// Forward declaration (Mat3ToQuat is defined later in this file).
@@ -1219,12 +1650,22 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		std::uintptr_t a_localOffset)
 	{
 		Quat q{ a_anim.rotation.x, a_anim.rotation.y, a_anim.rotation.z, a_anim.rotation.w };
+		float ql = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+		if (ql > 1e-12f && std::fabs(ql - 1.f) > 1e-4f) {
+			const float inv = 1.f / std::sqrt(ql);
+			q.x *= inv; q.y *= inv; q.z *= inv; q.w *= inv;
+		}
 		float rm[9];
 		QuatToMat(q, rm);
-		const float s = (a_anim.scale > 0.f && a_anim.scale < 1e6f) ? a_anim.scale : 1.f;
+		float sRaw = (a_anim.scale > 0.f && a_anim.scale < 1e6f) ? a_anim.scale : 1.f;
+		if (!std::isfinite(sRaw) || sRaw < 1e-4f || sRaw > 1e4f)
+			sRaw = 1.f;
+		if (g_naFForceUnitBoneScale.load(std::memory_order_acquire))
+			sRaw = 1.f;
+		const float s = sRaw;
 		__try {
 			float* p = reinterpret_cast<float*>(reinterpret_cast<std::uint8_t*>(a_node) + a_localOffset);
-			// Column-major 4x4 (ozz Float4x4 layout): col0, col1, col2, col3
+			// Column-major 4x4 (ozz Float4x4 layout): col0, col1, col2
 			p[0] = rm[0] * s;  p[1] = rm[3] * s;  p[2] = rm[6] * s;  p[3] = 0.f;
 			p[4] = rm[1] * s;  p[5] = rm[4] * s;  p[6] = rm[7] * s;  p[7] = 0.f;
 			p[8] = rm[2] * s;  p[9] = rm[5] * s;  p[10] = rm[8] * s; p[11] = 0.f;
@@ -1233,6 +1674,67 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 			static std::atomic<uint32_t> s_c{ 0 };
 			if (s_c++ < 3)
 				SAF_LOG_WARN("[APPLY] NAF full 4x4 write AV node={:p} off=+0x{:X}", static_cast<void*>(a_node), a_localOffset);
+		}
+	}
+
+	// NAF full apply + explicit Y-up->Z-up conversion for rotation and translation.
+	__declspec(noinline) static void ApplyTransformNAFFullConverted(
+		RE::NiAVObject* a_node,
+		const Animation::Transform& a_anim,
+		std::uintptr_t a_localOffset)
+	{
+		Quat q{ a_anim.rotation.x, a_anim.rotation.y, a_anim.rotation.z, a_anim.rotation.w };
+		float ql = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+		if (ql > 1e-12f && std::fabs(ql - 1.f) > 1e-4f) {
+			const float inv = 1.f / std::sqrt(ql);
+			q.x *= inv; q.y *= inv; q.z *= inv; q.w *= inv;
+		}
+		float rm[9];
+		QuatToMat(q, rm);
+		float rz[9];
+		const bool flip = g_yUpToZUpConversionFlip.load(std::memory_order_acquire);
+		const bool useSimilarity = g_yUpToZUpConversionConjugate.load(std::memory_order_acquire);
+		if (useSimilarity) {
+			if (flip) {
+				rz[0]=rm[0]; rz[1]=-rm[2]; rz[2]=rm[1];
+				rz[3]=-rm[6]; rz[4]=rm[8]; rz[5]=-rm[7];
+				rz[6]=rm[3]; rz[7]=-rm[5]; rz[8]=rm[4];
+			} else {
+				rz[0]=rm[0]; rz[1]=rm[2]; rz[2]=-rm[1];
+				rz[3]=rm[6]; rz[4]=rm[8]; rz[5]=-rm[7];
+				rz[6]=-rm[3]; rz[7]=-rm[5]; rz[8]=rm[4];
+			}
+		} else {
+			rz[0]=rm[0]; rz[1]=rm[1]; rz[2]=rm[2];
+			if (flip) {
+				rz[3]=-rm[6]; rz[4]=-rm[7]; rz[5]=-rm[8];
+				rz[6]=rm[3]; rz[7]=rm[4]; rz[8]=rm[5];
+			} else {
+				rz[3]=rm[6]; rz[4]=rm[7]; rz[5]=rm[8];
+				rz[6]=-rm[3]; rz[7]=-rm[4]; rz[8]=-rm[5];
+			}
+		}
+		const float tx = a_anim.translation.x;
+		const float ty = a_anim.translation.y;
+		const float tz = a_anim.translation.z;
+		const float tzupY = flip ? -tz : tz;
+		const float tzupZ = flip ? ty : -ty;
+		float sRaw = (a_anim.scale > 0.f && a_anim.scale < 1e6f) ? a_anim.scale : 1.f;
+		if (!std::isfinite(sRaw) || sRaw < 1e-4f || sRaw > 1e4f)
+			sRaw = 1.f;
+		if (g_naFForceUnitBoneScale.load(std::memory_order_acquire))
+			sRaw = 1.f;
+		const float s = sRaw;
+		__try {
+			float* p = reinterpret_cast<float*>(reinterpret_cast<std::uint8_t*>(a_node) + a_localOffset);
+			p[0] = rz[0] * s;  p[1] = rz[3] * s;  p[2] = rz[6] * s;  p[3] = 0.f;
+			p[4] = rz[1] * s;  p[5] = rz[4] * s;  p[6] = rz[7] * s;  p[7] = 0.f;
+			p[8] = rz[2] * s;  p[9] = rz[5] * s;  p[10] = rz[8] * s; p[11] = 0.f;
+			p[12] = tx; p[13] = tzupY; p[14] = tzupZ; p[15] = 1.f;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			static std::atomic<uint32_t> s_c{ 0 };
+			if (s_c++ < 3)
+				SAF_LOG_WARN("[APPLY] NAF converted 4x4 write AV node={:p} off=+0x{:X}", static_cast<void*>(a_node), a_localOffset);
 		}
 	}
 
@@ -1246,6 +1748,42 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 			out[0]=p[0]; out[1]=p[1]; out[2]=p[2];
 			out[3]=p[4]; out[4]=p[5]; out[5]=p[6];
 			out[6]=p[8]; out[7]=p[9]; out[8]=p[10];
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// Odczyt skali local roota aktora (diagnostyka narastania skali między
+	// scenami — np. rescale Ebaneksa bez przywrócenia). No C++ objects in __try.
+	__declspec(noinline) static bool ReadRootLocalScale(RE::NiAVObject* a_root, float& a_out)
+	{
+		__try {
+			if (!a_root) {
+				return false;
+			}
+			RE::NiNode* ni = a_root->GetAsNiNode();
+			if (!ni) {
+				return false;
+			}
+			a_out = ni->local.scale;
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// Odczyt world-translate roota 3D (pozycja WIZUALNA, w odróżnieniu od
+	// data.location). Rozstrzyga, czy pływanie to root, czy kości klipu.
+	__declspec(noinline) static bool ReadRootWorldPos(RE::NiAVObject* a_root, float& a_x, float& a_y, float& a_z)
+	{
+		__try {
+			if (!a_root) {
+				return false;
+			}
+			a_x = a_root->world.translate.x;
+			a_y = a_root->world.translate.y;
+			a_z = a_root->world.translate.z;
 			return true;
 		} __except (EXCEPTION_EXECUTE_HANDLER) {
 			return false;
@@ -1282,6 +1820,9 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 			qz = 0.25f * s;
 		}
 	}
+
+	// Forward declaration (defined below).
+	__declspec(noinline) static void RestoreBoneRotationRaw(RE::NiAVObject* a_node, std::uintptr_t a_off, const float* a_rot9);
 
 	// Read full NiTransform (rotation + translation) from node. NiTransform: rotate at a_off, translate at a_off+0x30.
 	// Returns false on AV. Fills Animation::Transform (rotation as quat, translation, scale=1).
@@ -1326,6 +1867,25 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 			p[0] = a_trans3[0];
 			p[1] = a_trans3[1];
 			p[2] = a_trans3[2];
+		} __except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+
+	// Anchor hard-pin: zapisuje kotwicę w local.translate ORAZ w world/previousWorld.
+	// Sam zapis locala zależy od tego, czy silnik przeliczy world w tej samej klatce;
+	// przy losowych startach sceny renderowany root zostawał na pozycji sprzed
+	// SetActorPosition (aktory się rozjeżdżały). Wpisujemy world wprost, żeby
+	// pierwsza wyrenderowana klatka była już na kotwicy.
+	__declspec(noinline) static void PinRootTranslationHard(RE::NiAVObject* a_node, std::uintptr_t a_off, const float* a_trans3)
+	{
+		if (!a_node) return;
+		if (a_off != 0) {
+			RestoreBoneTranslationRaw(a_node, a_off, a_trans3);
+		}
+		__try {
+			a_node->world.translate.x = a_trans3[0];
+			a_node->world.translate.y = a_trans3[1];
+			a_node->world.translate.z = a_trans3[2];
+			a_node->previousWorld.translate = a_node->world.translate;
 		} __except (EXCEPTION_EXECUTE_HANDLER) {}
 	}
 
@@ -1479,7 +2039,25 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 	static bool IsFaceJoint(const char* a_name)
 	{
 		if (!a_name || !*a_name) return false;
-		const char* sub[] = { "Eye", "Jaw", "faceBone", nullptr };
+		const char* sub[] = { "Eye", "Jaw", "faceBone_", nullptr };
+		for (int h = 0; sub[h]; ++h) {
+			const char* subStr = sub[h];
+			const char* p = a_name;
+			while (*p) {
+				const char* q = p, * s = subStr;
+				while (*q && *s && std::tolower(static_cast<unsigned char>(*q)) == std::tolower(static_cast<unsigned char>(*s))) { ++q; ++s; }
+				if (!*s) return true;
+				++p;
+			}
+		}
+		return false;
+	}
+	// Kości brzucha (Belly, Stomach, Abdomen): potrzebują korekcji
+	// aby uniknąć nieprawidłowego pozycjonowania
+	static bool IsBellyJoint(const char* a_name)
+	{
+		if (!a_name || !*a_name) return false;
+		const char* sub[] = { "Belly", "Stomach", "Abdomen", nullptr };
 		for (int h = 0; sub[h]; ++h) {
 			const char* subStr = sub[h];
 			const char* p = a_name;
@@ -1510,6 +2088,68 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		}
 		return false;
 	}
+	// Łańcuch penisa (C_Penis_*): w NAF pełna 4×4 z klipu — inaczej przy Physics+NAF zostaje tylko rotacja
+	// i translacja z animacji (+18, dopasowanie do ust) się gubi („penis za nisko”).
+	static bool IsPenisChainJoint(const char* a_name)
+	{
+		if (!a_name || !*a_name) return false;
+		const char* sub[] = { "C_Penis_", nullptr };
+		for (int h = 0; sub[h]; ++h) {
+			const char* subStr = sub[h];
+			const char* p = a_name;
+			while (*p) {
+				const char* q = p, * s = subStr;
+				while (*q && *s && std::tolower(static_cast<unsigned char>(*q)) == std::tolower(static_cast<unsigned char>(*s))) { ++q; ++s; }
+				if (!*s) return true;
+				++p;
+			}
+		}
+		return false;
+	}
+	// Tkanki waginy/labiów/łechtaczki. Uwaga: bez GenitalsRoot — ten korzeń ma zostać
+	// w "normalnej" logice Physics, bo jego wyłączenie rozłączało dół brzucha i podbijało penisa.
+	static bool IsVaginaChainJoint(const char* a_name)
+	{
+		if (!a_name || !*a_name) return false;
+		const char* sub[] = { "C_Vagina_", "Labia", "Clitoris", nullptr };
+		for (int h = 0; sub[h]; ++h) {
+			const char* subStr = sub[h];
+			const char* p = a_name;
+			while (*p) {
+				const char* q = p, * s = subStr;
+				while (*q && *s && std::tolower(static_cast<unsigned char>(*q)) == std::tolower(static_cast<unsigned char>(*s))) { ++q; ++s; }
+				if (!*s) return true;
+				++p;
+			}
+		}
+		return false;
+	}
+	// Lista Physics z INI używana przy SAF apply — łańcuch waginy wykluczony (jak zwykłe kości ciała: pełny NAF, te same reguły kanału co biodra/korpus).
+	static bool IsPhysicsJointForSafApply(const char* a_name)
+	{
+		return IsPhysicsJoint(a_name) && !IsVaginaChainJoint(a_name);
+	}
+	// Kości faceBone wokół ust (UpdateGraphs: nie pomijamy jak resztę faceBone_*).
+	// Nazwy z typowego szkieletu (nodes użytkownika).
+	static bool IsMouthRegionFaceJoint(const char* a_name)
+	{
+		if (!a_name) return false;
+		static const char* kNames[] = {
+			"faceBone_C_MouthPivot",
+			"faceBone_C_LipsTop",
+			"faceBone_C_LipsBottom",
+			"faceBone_L_Cheek",
+			"faceBone_R_Cheek",
+			"faceBone_C_Chin",
+			"faceBone_C_UnderChin",
+			nullptr
+		};
+		for (const char** n = kNames; *n; ++n) {
+			if (std::strcmp(a_name, *n) == 0)
+				return true;
+		}
+		return false;
+	}
 	// Kości piersi i włosów - zostaw pod kontrolą gry aby uniknąć zniekształceń na meblach
 	static bool IsBreastOrHairJoint(const char* a_name)
 	{
@@ -1527,6 +2167,157 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		}
 		return false;
 	}
+	// Dopasowanie substringu bez rozróżniania wielkości liter (case-insensitive).
+	static bool ContainsSubCI(const char* a_name, const std::string& a_sub)
+	{
+		if (!a_name || !*a_name || a_sub.empty()) return false;
+		const char* s = a_sub.c_str();
+		for (const char* p = a_name; *p; ++p) {
+			const char* q = p;
+			const char* t = s;
+			while (*q && *t && std::tolower(static_cast<unsigned char>(*q)) == std::tolower(static_cast<unsigned char>(*t))) { ++q; ++t; }
+			if (!*t) return true;
+		}
+		return false;
+	}
+	// PreserveBones: kości, których SAF NIE pisze w ogóle — zostają w wyłącznej
+	// kontroli gry (jej animacja + fizyka/jiggle). Zapobiega „walce” o node->local
+	// (drganie/przyspieszanie) na kościach wtórnych, szczególnie na meblach.
+	// Uwzględnia też starą listę BreastHairJoints (kompatybilność wstecz).
+	static bool IsPreservedJoint(const char* a_name)
+	{
+		if (!a_name || !*a_name) return false;
+		{
+			std::lock_guard<std::mutex> lock(g_preserveJointsMutex);
+			for (const auto& sub : g_preserveJoints) {
+				if (ContainsSubCI(a_name, sub)) return true;
+			}
+		}
+		{
+			std::lock_guard<std::mutex> lock(g_breastHairJointsMutex);
+			for (const auto& sub : g_breastHairJoints) {
+				if (ContainsSubCI(a_name, sub)) return true;
+			}
+		}
+		return false;
+	}
+
+	// Pre-kompilacja flag typu kości (JointFlag bitmask) na podstawie nazw ze szkieletu.
+	// Wołana raz przy budowie mapy jointów – zamiast 10+ Is*() string porównań co klatkę.
+	static void BuildJointTypeFlags(ActorGraphState& a_state)
+	{
+		if (!a_state.skeleton) return;
+		const size_t n = a_state.skeleton->jointNames.size();
+		a_state.jointTypeFlags.resize(n, ActorGraphState::kFlagNone);
+		for (size_t i = 0; i < n; ++i) {
+			const char* name = a_state.skeleton->jointNames[i].c_str();
+			if (!name || !*name) continue;
+			uint32_t flags = ActorGraphState::kFlagNone;
+
+			// IsFaceJoint
+			if (IsFaceJoint(name)) {
+				flags |= ActorGraphState::kFlagFace;
+				if (IsMouthRegionFaceJoint(name))
+					flags |= ActorGraphState::kFlagMouthRegion;
+			}
+			// IsBellyJoint
+			if (IsBellyJoint(name))
+				flags |= ActorGraphState::kFlagBelly;
+			// IsVaginaChainJoint
+			if (IsVaginaChainJoint(name))
+				flags |= ActorGraphState::kFlagVaginaChain;
+			// IsHandJoint
+			if (IsHandJoint(name))
+				flags |= ActorGraphState::kFlagHand;
+			// IsPhysicsJoint (INI)
+			if (IsPhysicsJoint(name))
+				flags |= ActorGraphState::kFlagPhysics;
+			// IsArmOrHandJoint
+			if (IsArmOrHandJoint(name))
+				flags |= ActorGraphState::kFlagArmOrHand;
+			// IsUpperArmOnlyJoint
+			if (IsUpperArmOnlyJoint(name))
+				flags |= ActorGraphState::kFlagUpperArmOnly;
+			// IsTorsoRefJoint
+			if (IsTorsoRefJoint(name))
+				flags |= ActorGraphState::kFlagTorsoRef;
+			// IsCalfOrFootJoint
+			if (IsCalfOrFootJoint(name))
+				flags |= ActorGraphState::kFlagCalfOrFoot;
+			// IsSpineOrLegJoint
+			if (IsSpineOrLegJoint(name))
+				flags |= ActorGraphState::kFlagSpineOrLeg;
+			// IsPreservedJoint (PreserveBones/BreastHairJoints) — 100% game control
+			if (IsPreservedJoint(name))
+				flags |= ActorGraphState::kFlagPreserve;
+
+			a_state.jointTypeFlags[i] = flags;
+		}
+	}
+
+	// Czy przy zdejmowaniu animacji (Detach/Reset/Refresh/pre-restore przed
+	// następną animacją) wolno przywrócić staw i ze snapshotu gameBase?
+	// MUSI być lustrzanym odbiciem warunków pomijania w pętli UpdateGraphs:
+	// stawy, których SAF co klatkę NIE rusza (twarz poza ustami, brzuch,
+	// łańcuch waginy, dłonie/fizyka bez kanału w klipie, duplikaty, root)
+	// należą do gry (FaceGen/IK/fizyka) i gra mogła je zmienić W TRAKCIE
+	// animacji. Przywrócenie ich ze snapshotu sprzed animacji nadpisywałoby
+	// żywy stan gry nieaktualnymi danymi – objaw: „wyraz twarzy zostaje”
+	// po zakończeniu animacji (pomagał dopiero save/load, bo odbudowywał 3D).
+	// Gdy flag/kanałów nie znamy (puste wektory) – zachowawczo true (stare zachowanie).
+	static bool ShouldRestoreJointOnDetach(const ActorGraphState& a_state, size_t i,
+		RE::NiAVObject* a_skeletonRootNode, RE::NiAVObject* a_actorRoot)
+	{
+		if (i >= a_state.jointNodes.size())
+			return false;
+		RE::NiAVObject* node = a_state.jointNodes[i];
+		if (!node)
+			return false;
+		// Root / duplikaty – UpdateGraphs nigdy tu nie pisze.
+		if (i == 0)
+			return false;
+		if (a_skeletonRootNode && node == a_skeletonRootNode)
+			return false;
+		if (a_actorRoot && node == a_actorRoot)
+			return false;
+		{
+			bool alreadyApplied = false;
+			for (size_t j = 0; j < i && j < a_state.jointNodes.size(); ++j) {
+				if (a_state.jointNodes[j] == node) {
+					alreadyApplied = true;
+					break;
+				}
+			}
+			if (alreadyApplied)
+				return false;
+		}
+		const uint32_t jflags = (i < a_state.jointTypeFlags.size())
+			? a_state.jointTypeFlags[i]
+			: ActorGraphState::kFlagNone;
+		const bool hasChannel = (i < a_state.jointHasChannel.size())
+			? (a_state.jointHasChannel[i] != 0)
+			: true;  // nieznane -> zachowawczo jak „animowany” (stare zachowanie)
+		// Kości twarzy poza okolicą ust – zawsze pod kontrolą gry.
+		if ((jflags & ActorGraphState::kFlagFace) && !(jflags & ActorGraphState::kFlagMouthRegion))
+			return false;
+		// Brzuch i łańcuch waginy – zawsze pod kontrolą gry.
+		if (jflags & ActorGraphState::kFlagBelly)
+			return false;
+		if (jflags & ActorGraphState::kFlagVaginaChain)
+			return false;
+		// PreserveBones (włosy/piersi/jądra) – zawsze pod kontrolą gry; nie
+		// przywracamy ich ze snapshotu, bo gra mogła je zmienić w trakcie.
+		if (jflags & ActorGraphState::kFlagPreserve)
+			return false;
+		// Usta/dłonie/fizyka – tylko gdy klip ma dla nich kanał (czyli SAF je ruszał).
+		if ((jflags & ActorGraphState::kFlagMouthRegion) && !hasChannel)
+			return false;
+		if ((jflags & ActorGraphState::kFlagHand) && !hasChannel)
+			return false;
+		if ((jflags & ActorGraphState::kFlagPhysics) && !(jflags & ActorGraphState::kFlagVaginaChain) && !hasChannel)
+			return false;
+		return true;
+	}
 
 	// Apply animation to a bone using delta-rotation:
 	//   delta  = inv(ozz_rest_rot) * ozz_anim_rot
@@ -1542,9 +2333,15 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		const Animation::Transform& a_rest,
 		const float a_gameBase[9],
 		std::uintptr_t a_off,
-		const char* a_jointName = nullptr)
+		const char* a_jointName = nullptr,
+		bool a_convertYUp = true)
 	{
 		float r00, r01, r02, r10, r11, r12, r20, r21, r22;
+
+		// Per-clip up-axis space ANDed with the global switch: GLB clips are
+		// Y-up (convert), FBX world clips are already game Z-up (raw). When the
+		// global switch is off, everything stays raw (escape hatch).
+		const bool doConversion = a_convertYUp && g_applyYUpToZUpConversion.load(std::memory_order_acquire);
 
 		// Y-up (GLTF) → Z-up (Creation Engine). Similarity C×delta×C⁻¹: T-pose I → C×I×C⁻¹ = I ✓; movement correctly in Z-up.
 		auto ApplyYUpToZUp = [](const float m[9], float out[9]) {
@@ -1580,12 +2377,25 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		};
 
 		if (g_useNAFApplyMode.load(std::memory_order_acquire)) {
-			// NAF-style apply: full 4x4 local (rotation + translation + scale) to NiNode::local,
-			// like NAF PushAnimationOutput. No rest/game_base, no Y-up conversion, no spine/arm fixes.
-			//
-			// Kości fizyczne (Penis, Balls, Genitals itp.) RÓWNIEŻ używają NAF mode
-			// (absolutna rotacja z animacji). Poprzedni patch wychodził do delta+base
-			// co dawało podwójną rotację i zniekształcenia.
+			// Kości Physics z INI (bez łańcucha waginy — ten jak reszta ciała): w NAF zwykle tylko rotacja.
+			// Penis (C_Penis_*): wyjątek — pełna 4×4 z klipu.
+			// UWAGA: celowo surowe pisanie BEZ konwersji Y-up→Z-up (revert):
+			// konwersja w tej ścieżce deformowała modele. Pozycjonowanie
+			// (root/kapsuła Havok) jest obsługiwane gdzie indziej, nie kośćmi.
+			if (a_jointName && IsPhysicsJointForSafApply(a_jointName)) {
+				if (!IsPenisChainJoint(a_jointName)) {
+					Quat q{ a_anim.rotation.x, a_anim.rotation.y, a_anim.rotation.z, a_anim.rotation.w };
+					const float ql = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
+					if (ql > 1e-12f && std::fabs(ql - 1.f) > 1e-4f) {
+						const float inv = 1.f / std::sqrt(ql);
+						q.x *= inv; q.y *= inv; q.z *= inv; q.w *= inv;
+					}
+					float rm[9]; QuatToMat(q, rm);
+					const float rt[9] = { rm[0],rm[3],rm[6], rm[1],rm[4],rm[7], rm[2],rm[5],rm[8] };
+					RestoreBoneRotationRaw(a_node, a_off, rt);
+					return;
+				}
+			}
 			ApplyTransformNAFFull(a_node, a_anim, a_off);
 			return;
 		}
@@ -1596,7 +2406,7 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 			QuatToMat(aq, am);
 			const float* d;
 			float amConv[9];
-			if (g_applyYUpToZUpConversion.load(std::memory_order_acquire)) {
+			if (doConversion) {
 				ApplyYUpToZUp(am, amConv);
 				d = amConv;
 			} else {
@@ -1612,7 +2422,6 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 			float dm[9];
 			QuatToMat(QuatMul(QuatConj(rq), aq), dm);
 
-			const bool doConversion = g_applyYUpToZUpConversion.load(std::memory_order_acquire);
 			const bool unifiedYUp = g_unifiedYUpSpace.load(std::memory_order_acquire) && doConversion;
 			// For arm joints, optional override of rotation order (0=global, 1=delta*base, 2=base*delta).
 			bool orderDeltaThenBase = g_rotationOrderDeltaThenBase.load(std::memory_order_acquire);
@@ -1963,7 +2772,8 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		const Animation::Transform& a_anim,
 		const Animation::Transform& a_rest,
 		const float a_gameBase[9],
-		const char* a_jointName = nullptr)
+		const char* a_jointName = nullptr,
+		bool a_convertYUp = true)
 	{
 		if (!a_node) return;
 		if (!g_niTransformSearchDone.load(std::memory_order_acquire)) {
@@ -1971,7 +2781,7 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 				g_niTransformOffset.store(ProbeNiTransformOffset(a_node), std::memory_order_release);
 			}
 		}
-		ApplyTransformRaw(a_node, a_anim, a_rest, a_gameBase, g_niTransformOffset.load(std::memory_order_acquire), a_jointName);
+		ApplyTransformRaw(a_node, a_anim, a_rest, a_gameBase, g_niTransformOffset.load(std::memory_order_acquire), a_jointName, a_convertYUp);
 	}
 
 	/// Returns true if p looks like a valid NiAVObject (GetAsNiNode works). Used to reject wrong raw-read ptrs (e.g. handleList). No C++ objects with destructors.
@@ -1985,9 +2795,8 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		}
 	}
 
-	/// Try to get actor 3D root. Prefer game's Get3D vfunc (Unk_AC); then raw loadedData->data3D.
-	/// Never use 0xC8 – that is extraDataList, not 3D (causes AV on traverse).
-	static RE::NiAVObject* GetActor3DRootRaw(RE::Actor* a_actor)
+	/// Internal 3D-root probe; caller should wrap in SEH if used during load/revert.
+	static RE::NiAVObject* GetActor3DRootRawImpl(RE::Actor* a_actor)
 	{
 		if (!a_actor) return nullptr;
 		const auto* base = reinterpret_cast<const std::uint8_t*>(a_actor);
@@ -2049,6 +2858,21 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 				*reinterpret_cast<const void* const*>(base + 0xC0));
 		}
 		return nullptr;
+	}
+
+	/// Try to get actor 3D root. Prefer game's Get3D vfunc (Unk_AC); then raw loadedData->data3D.
+	/// Never use 0xC8 – that is extraDataList, not 3D (causes AV on traverse).
+	static RE::NiAVObject* GetActor3DRootRaw(RE::Actor* a_actor)
+	{
+		__try {
+			return GetActor3DRootRawImpl(a_actor);
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			static std::atomic<bool> s_logged{ false };
+			if (!s_logged.exchange(true)) {
+				SAF_LOG_WARN("[3D] GetActor3DRootRaw: SEH caught AV - returning nullptr");
+			}
+			return nullptr;
+		}
 	}
 
 	static void BuildJointMap(RE::Actor* a_actor, const Animation::OzzSkeleton& a_skeleton, std::vector<RE::NiAVObject*>& a_out)
@@ -2198,6 +3022,8 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 
 	// Forward declaration: used by TryBuildJointMapAndCaptureState (defined before UnpackSoaTransforms implementation).
 	static void UnpackSoaTransforms(std::span<const ozz::math::SoaTransform> a_soa, std::vector<Animation::Transform>& a_out, size_t a_jointCount);
+	// Forward declaration: converts a file bind pose (ozz locals) to Animation::Transform rest pose.
+	static void UnpackBindPose(const std::vector<ozz::math::Transform>& a_bind, std::vector<Animation::Transform>& a_out, size_t a_jointCount);
 
 	/// Build joint map and capture rest/game base for this actor's state. Called from LoadAndStartAnimation (saf play) so we don't defer to UpdateGraphs.
 	/// Returns true if built successfully; false if actor 3D not ready (UpdateGraphs will retry later). Caller must hold g_graphMutex for state.
@@ -2218,16 +3044,22 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		SAF_LOG_INFO("[ATTACH] BuildJointMap done for actor {:X} (found {}/{}), rest/game base capture", a_actor->GetFormID(), found, state.jointNodes.size());
 
 		if (state.skeleton && state.skeleton->data) {
-			if (auto* clipGen = dynamic_cast<Animation::ClipGenerator*>(state.generator.get())) {
-				static thread_local std::vector<ozz::math::SoaTransform> s_restSoaBuf;
-				clipGen->SampleAtRatio(0.f, s_restSoaBuf);
-				UnpackSoaTransforms(std::span<const ozz::math::SoaTransform>(s_restSoaBuf.data(), s_restSoaBuf.size()),
-					state.restTransforms, state.skeleton->jointNames.size());
+			// Rest = file bind pose carried by the ClipGenerator (GLB node TRS /
+			// FBX game rest). Clip frame 0 must NOT be used as rest: scene clips
+			// (furniture / multi-actor) start in a scene pose, and frame-0 rest
+			// would erase the absolute pose (hover above furniture, actors apart).
+			const auto* clipGen = dynamic_cast<Animation::ClipGenerator*>(state.generator.get());
+			if (clipGen && clipGen->HasBindPose() &&
+				clipGen->GetBindPose().size() == state.skeleton->jointNames.size()) {
+				UnpackBindPose(clipGen->GetBindPose(), state.restTransforms, state.skeleton->jointNames.size());
 			} else {
 				auto restSoa = state.skeleton->data->joint_rest_poses();
 				UnpackSoaTransforms(restSoa, state.restTransforms, state.skeleton->jointNames.size());
 			}
 		}
+		// Pre-kompiluj flagi typów kości (jeśli nie zrobione przez UpdateGraphs)
+		if (state.jointTypeFlags.empty())
+			BuildJointTypeFlags(state);
 		if (!g_niTransformSearchDone.load(std::memory_order_acquire)) {
 			for (size_t si = 0; si < state.jointNodes.size(); ++si) {
 				if (state.jointNodes[si]) {
@@ -2278,8 +3110,118 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		return true;
 	}
 
-	/// Call UpdateWorldData on root; if a_modifiedBones is non-empty and UseUpdateTransformAndBounds is true,
-	/// call UpdateTransformAndBounds on each modified bone (never on root) so the renderer sees animation without the character disappearing.
+	// Capture the actor's real skeleton rest pose (local rotations + hierarchy + translations) from its
+	// live NiNode tree. Used by the FBX world-space retarget when the ModelDB rest pose is unavailable
+	// (ModelDB::GetEntry returns no model / empty race skeleton fields). Rotations are read in game
+	// (Z-up) space; the root rotation is excluded (treated as identity) so the world rest matches the
+	// game's neutral skeleton frame used by the retarget formula.
+	static bool CaptureActorRestPose(RE::Actor* a_actor, const Animation::OzzSkeleton& a_skeleton, Animation::GameRestPose& out)
+	{
+		out.rotations.clear();
+		out.parents.clear();
+		out.translations.clear();
+		if (!a_actor) {
+			SAF_LOG_WARN("[REST] CaptureActorRestPose: actor is null");
+			return false;
+		}
+		const size_t jointCount = a_skeleton.jointNames.size();
+		if (jointCount == 0)
+			return false;
+
+		std::vector<RE::NiAVObject*> jointNodes;
+		if (!SafeBuildJointMap(a_actor, a_skeleton, jointNodes)) {
+			SAF_LOG_WARN("[REST] CaptureActorRestPose: BuildJointMap failed");
+			return false;
+		}
+
+		out.rotations.assign(jointCount, ozz::math::Quaternion::identity());
+		out.parents.assign(jointCount, -1);
+		out.translations.assign(jointCount, ozz::math::Float3::zero());
+
+		std::uintptr_t off = g_niTransformOffset.load(std::memory_order_acquire);
+		if (off == 0) {
+			for (auto* node : jointNodes) {
+				if (node) {
+					off = ProbeNiTransformOffset(node);
+					g_niTransformOffset.store(off, std::memory_order_release);
+					break;
+				}
+			}
+		}
+		if (off == 0) {
+			SAF_LOG_WARN("[REST] CaptureActorRestPose: no NiTransform offset");
+			return false;
+		}
+
+		// Canonical joint name -> index map for parent resolution (handles "NPC " prefix / underscores).
+		std::unordered_map<std::string, int16_t> nameToIdx;
+		nameToIdx.reserve(jointCount);
+		for (size_t i = 0; i < jointCount; ++i) {
+			if (a_skeleton.jointNames[i].empty())
+				continue;
+			nameToIdx.emplace(NormalizeBoneName(a_skeleton.jointNames[i]), static_cast<int16_t>(i));
+		}
+
+		size_t withRot = 0, withParent = 0;
+		for (size_t i = 0; i < jointCount; ++i) {
+			if (i >= jointNodes.size() || !jointNodes[i])
+				continue;
+			RE::NiAVObject* node = jointNodes[i];
+			Animation::Transform tr;
+			if (ReadBoneFullTransform(node, off, tr)) {
+				// Exclude root rotation (actor 3D root / skeleton root must be identity
+				// so the retarget formula works in the game's neutral skeleton frame).
+				if (i == 0 || jointNodes[i] == jointNodes[0])
+					tr.rotation = { 0.f, 0.f, 0.f, 1.f };
+				out.rotations[i] = ozz::math::Quaternion(tr.rotation.x, tr.rotation.y, tr.rotation.z, tr.rotation.w);
+				out.translations[i] = ozz::math::Float3(tr.translation.x, tr.translation.y, tr.translation.z);
+				++withRot;
+			}
+			if (RE::NiNode* parent = node->parent) {
+				char buf[256];
+				if (GetNodeNameSafe(parent, buf, sizeof(buf)) && buf[0]) {
+					auto it = nameToIdx.find(NormalizeBoneName(buf));
+					if (it != nameToIdx.end() && it->second != static_cast<int16_t>(i)) {
+						out.parents[i] = it->second;
+						++withParent;
+					}
+				}
+			}
+		}
+		SAF_LOG_INFO("[REST] CaptureActorRestPose: {} joints, {} rotations, {} parents resolved", jointCount, withRot, withParent);
+		// Diagnostic: log rest pose for key spine/head bones so we can see if the
+		// hierarchy and rotations look reasonable.
+		auto logBone = [&](const char* name) {
+			for (size_t i = 0; i < jointCount; ++i) {
+				if (a_skeleton.jointNames[i] == name) {
+					const auto& q = out.rotations[i];
+					SAF_LOG_INFO("[REST] {} idx={} parent={} q=({:.4f},{:.4f},{:.4f},{:.4f}) trans=({:.3f},{:.3f},{:.3f})",
+						name, (int)i, (int)out.parents[i], q.x, q.y, q.z, q.w,
+						out.translations[i].x, out.translations[i].y, out.translations[i].z);
+					// Walk parent chain
+					std::string chain;
+					int16_t p = (int16_t)i;
+					int depth = 0;
+					while (p >= 0 && depth < 10) {
+						chain = a_skeleton.jointNames[p] + " -> " + chain;
+						p = out.parents[p];
+						depth++;
+					}
+					if (!chain.empty()) chain.pop_back(); // remove trailing " -> "
+					if (!chain.empty()) chain.pop_back();
+					SAF_LOG_INFO("[REST] {} chain: {}", name, chain);
+					break;
+				}
+			}
+		};
+		logBone("C_Hips");
+		logBone("C_Spine");
+		logBone("C_Spine1");
+		logBone("C_Neck");
+		logBone("C_Head");
+		return withRot > 0;
+	}
+
 	static void SafeUpdateWorldData(RE::Actor* a_actor, RE::NiAVObject* a_actorRoot, const std::vector<RE::NiAVObject*>* a_modifiedBones)
 	{
 		if (!a_actor) return;
@@ -2335,7 +3277,71 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 				auto& t = a_out[idx];
 				t.translation = { tx[lane], ty[lane], tz[lane] };
 				t.rotation = { rx[lane], ry[lane], rz[lane], rw[lane] };
-				t.scale = sx[lane];
+				if (g_normalizeUnpackQuaternions.load(std::memory_order_acquire)) {
+					float qx = t.rotation.x;
+					float qy = t.rotation.y;
+					float qz = t.rotation.z;
+					float qw = t.rotation.w;
+					const float ql = qx * qx + qy * qy + qz * qz + qw * qw;
+					if (ql > 1e-18f) {
+						if (std::fabs(ql - 1.f) > 1e-5f) {
+							const float inv = 1.f / std::sqrt(ql);
+							qx *= inv;
+							qy *= inv;
+							qz *= inv;
+							qw *= inv;
+						}
+						t.rotation = { qx, qy, qz, qw };
+					} else {
+						t.rotation = { 0.f, 0.f, 0.f, 1.f };
+					}
+				}
+				{
+					const float cxx = sx[lane];
+					const float cyy = sy[lane];
+					const float czz = sz[lane];
+					float oneD = cxx;
+					if (std::isfinite(cyy) && std::isfinite(czz) && std::isfinite(cxx)) {
+						const float g = cxx * cyy * czz;
+						if (g > 0.f)
+							oneD = std::pow(g, 1.f / 3.f);
+						else
+							oneD = (cxx + cyy + czz) / 3.f;
+					}
+					if (!std::isfinite(oneD) || oneD < 1e-4f || oneD > 1e4f)
+						oneD = 1.f;
+					t.scale = oneD;
+				}
+			}
+		}
+	}
+
+	// Converts a file bind pose (ozz local transforms, one per joint) to the
+	// Animation::Transform rest array used by the per-frame delta.
+	// Only rotation feeds the delta today (translation/scale stay game-owned),
+	// but translation is preserved for completeness.
+	static void UnpackBindPose(const std::vector<ozz::math::Transform>& a_bind, std::vector<Animation::Transform>& a_out, size_t a_jointCount)
+	{
+		a_out.resize(a_jointCount);
+		for (size_t i = 0; i < a_jointCount; ++i) {
+			auto& t = a_out[i];
+			if (i < a_bind.size()) {
+				const auto& b = a_bind[i];
+				t.translation = { b.translation.x, b.translation.y, b.translation.z };
+				float qx = b.rotation.x, qy = b.rotation.y, qz = b.rotation.z, qw = b.rotation.w;
+				const float ql = qx * qx + qy * qy + qz * qz + qw * qw;
+				if (ql > 1e-18f) {
+					if (std::fabs(ql - 1.f) > 1e-5f) {
+						const float inv = 1.f / std::sqrt(ql);
+						qx *= inv; qy *= inv; qz *= inv; qw *= inv;
+					}
+					t.rotation = { qx, qy, qz, qw };
+				} else {
+					t.rotation = { 0.f, 0.f, 0.f, 1.f };
+				}
+				t.scale = 1.0f;
+			} else {
+				t = Animation::Transform{};
 			}
 		}
 	}
@@ -2345,6 +3351,29 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		static auto lastTick = std::chrono::steady_clock::now();
 		static std::atomic<uint32_t> hookCallCount{ 0 };
 		uint32_t callNum = ++hookCallCount;
+
+		// During save/load/revert do not run SAF update logic; let game finish transition safely.
+		// Auto-clear after 30s if OnPostLoadGame was never called.
+		{
+			static std::chrono::steady_clock::time_point s_startTime;
+			static bool s_started = false;
+			if (g_saveLoadInProgress.load(std::memory_order_acquire)) {
+				if (!s_started) {
+					s_startTime = std::chrono::steady_clock::now();
+					s_started = true;
+				} else if (std::chrono::steady_clock::now() - s_startTime > std::chrono::seconds(g_saveLoadAutoClearSeconds.load(std::memory_order_acquire))) {
+					SAF_LOG_WARN("[HOOK] save-load in progress for >{}s, auto-clearing flag (OnPostLoadGame was likely never called)", g_saveLoadAutoClearSeconds.load(std::memory_order_acquire));
+					g_saveLoadInProgress.store(false, std::memory_order_release);
+					s_started = false;
+					// fall through to normal processing
+				}
+				if (g_saveLoadInProgress.load(std::memory_order_acquire)) {
+					return g_originalGraphUpdate ? g_originalGraphUpdate(a_this, a_param2, a_param3) : 0;
+				}
+			} else {
+				s_started = false;
+			}
+		}
 
 		// Skip our logic until player is in world (avoids crash when loading save - world/actor 3D not ready yet).
 		const uint32_t skipConfig = g_skipFirstNHookCallsConfig.load(std::memory_order_acquire);
@@ -2373,33 +3402,11 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 				Settings::SetSafeToUseExtendedSkeleton(true);
 			}
 		}
-		// Log pierwsze 10 wywołań, potem co 60 (co ~1 sekundę przy 60 FPS)
-		if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: ENTRY (call #{})", callNum);
-		}
-		
-		// ProcessPendingCommands wywoływane na main thread (GraphUpdateHook)
-
-		if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: calling original function");
-		}
 		int64_t result = g_originalGraphUpdate ? g_originalGraphUpdate(a_this, a_param2, a_param3) : 0;
-		if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: original function returned, result={}", result);
-		}
 
 	auto* mgr = GraphManager::GetSingleton();
-	const DWORD curThread = GetCurrentThreadId();
-	if (g_mainThreadId == 0) {
-		g_mainThreadId = curThread;
-		SAF_LOG_INFO("GraphManager: main thread id set to {}", g_mainThreadId);
-	}
-	if (g_rebindOnNextHook.exchange(false, std::memory_order_acq_rel)) {
-		SAF_LOG_INFO("GraphManager: main thread id rebind to {} (after attach)", curThread);
-		g_mainThreadId = curThread;
-	}
-	if (g_forceUpdate.exchange(false, std::memory_order_acq_rel)) {
-		SAF_LOG_INFO("GraphManager: force update on thread {} (after request)", curThread);
+		const DWORD curThread = GetCurrentThreadId();
+		if (g_mainThreadId == 0) {
 		g_mainThreadId = curThread;
 	}
 
@@ -2407,13 +3414,8 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 	const bool requested = Commands::SAFCommand::HasProcessRequest();
 	const bool hasDump = Commands::SAFCommand::HasPendingDump();
 	const bool dumpRequested = Commands::SAFCommand::ConsumeDumpRequest();
-	if (requested || hasPending || dumpRequested || hasDump) {
-		SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: pending flags (req={}, pending={}, dumpReq={}, dumpPending={}) thread={}",
-			requested, hasPending, dumpRequested, hasDump, curThread);
-		if (g_mainThreadId != curThread) {
-			SAF_LOG_INFO("GraphManager: main thread id rebind to {} (pending flags)", curThread);
-			g_mainThreadId = curThread;
-		}
+	if ((requested || hasPending || dumpRequested || hasDump) && g_mainThreadId != curThread) {
+		g_mainThreadId = curThread;
 	}
 	const bool isMainThread = (g_mainThreadId != 0 && curThread == g_mainThreadId);
 
@@ -2437,19 +3439,11 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		if (Commands::SAFCommand::ConsumeCloseConsole()) {
 			Commands::SAFCommand::CloseConsoleMainThread();
 		}
-		if (!isMainThread && (callNum <= 10 || callNum % 60 == 0)) {
-			SAF_LOG_WARN("[HOOK] GraphUpdateHookImpl: running ProcessPendingCommands on non-main thread {}", curThread);
-		}
 		Commands::SAFCommand::ProcessPendingCommands();
 	}
 	if (dumpRequested || hasDump) {
-		if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: calling ProcessPendingDump");
-		}
 		if (isMainThread) {
 			Commands::SAFCommand::ProcessPendingDump();
-		} else if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: skip ProcessPendingDump (non-main thread {})", curThread);
 		}
 	}
 
@@ -2464,22 +3458,11 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 				lastTick = now;
 				dtSeconds = dt.count();
 			}
-			if (!g_actorGraphs.empty()) {
-				if (callNum <= 10 || callNum % 60 == 0) {
-					SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: UpdateGraphs (graphs={}, dt={}, culled={})",
-						g_actorGraphs.size(), dtSeconds, modelCulled ? "true" : "false");
-				}
-			}
 			mgr->UpdateGraphs(dtSeconds);
 			g_updateGuard.clear(std::memory_order_release);
-		} else if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: UpdateGraphs skipped (guarded)");
 		}
 	}
 		
-		if (callNum <= 10 || callNum % 60 == 0) {
-			SAF_LOG_INFO("[HOOK] GraphUpdateHookImpl: EXIT");
-		}
 		return result;
 	}
 
@@ -2495,10 +3478,18 @@ static void BSAnimationGraphUpdateHook(RE::BSAnimationGraph* a_graph, RE::BSAnim
 		(*g_animGraphVtablePrimaryHook)(a_graph, a_updateData);
 	}
 
+	// During save/load transition run only original game logic.
+	if (g_saveLoadInProgress.load(std::memory_order_acquire)) {
+		return;
+	}
+
 	g_hookSeen.store(true, std::memory_order_release);
 
 	auto* mgr = GraphManager::GetSingleton();
 	const DWORD curThread = GetCurrentThreadId();
+	// UWAGA: NIE rebinduj g_mainThreadId — ten hook może odpalać się na wątku roboczym
+	// (Havok physics), a rebind blokuje główny wątek przed wywołaniem UpdateGraphs.
+	// GraphUpdateHookImpl (główny hook) zawsze działa na main thread i ustawia g_mainThreadId.
 	if (g_mainThreadId == 0) {
 		g_mainThreadId = curThread;
 		SAF_LOG_INFO("GraphManager: main thread id set to {} (BSAnimationGraph::Update)", g_mainThreadId);
@@ -2559,6 +3550,11 @@ static void AnimGraphManagerUpdateCallHook(RE::IAnimationGraphManagerHolder* a_h
 		g_originalAnimGraphManagerUpdate(a_holder, a_updateData, a_graph);
 	}
 
+	// During save/load transition run only original game logic.
+	if (g_saveLoadInProgress.load(std::memory_order_acquire)) {
+		return;
+	}
+
 	if (auto remaining = g_debugHookLogs.load(std::memory_order_relaxed); remaining > 0) {
 		g_debugHookLogs.fetch_sub(1, std::memory_order_relaxed);
 		SAF_LOG_INFO("[HOOK] AnimGraphManagerCallHook: callNum={}, thread={}", callNum, GetCurrentThreadId());
@@ -2568,6 +3564,10 @@ static void AnimGraphManagerUpdateCallHook(RE::IAnimationGraphManagerHolder* a_h
 
 	auto* mgr = GraphManager::GetSingleton();
 	const DWORD curThread = GetCurrentThreadId();
+	// NIE rebinduj g_mainThreadId — ten hook może odpalać się na wątku roboczym
+	// (update managera animacji bywa dispatchowany do jobów). Rebind kradł
+	// „main thread" i blokował pompę pętli zadaniowej na prawdziwym wątku głównym.
+	// Adoptuj wątek tylko raz (gdy jeszcze nieznany) — jak BSAnimationGraphUpdateHook.
 	if (g_mainThreadId == 0) {
 		g_mainThreadId = curThread;
 		SAF_LOG_INFO("GraphManager: main thread id set to {} (AnimGraphManagerCallHook)", g_mainThreadId);
@@ -2597,7 +3597,10 @@ static void AnimGraphManagerUpdateCallHook(RE::IAnimationGraphManagerHolder* a_h
 		if (!g_updateGuard.test_and_set(std::memory_order_acq_rel)) {
 			float dtSeconds = 0.0f;
 			bool modelCulled = false;
-			const bool hasUpdateData = ReadAnimUpdateData(a_updateData, dtSeconds, modelCulled);
+			// Call site bywa znajdowany skanem (primary offset przesunął się między wersjami
+			// gry) - jeśli argument nie wskazuje czytelnej pamięci, nie czytaj z niego dt.
+			const bool hasUpdateData = IsReadableRange(a_updateData, 0x70) &&
+				ReadAnimUpdateData(a_updateData, dtSeconds, modelCulled);
 			if (!hasUpdateData || !std::isfinite(dtSeconds) || dtSeconds <= 0.0f) {
 				const auto now = std::chrono::steady_clock::now();
 				const std::chrono::duration<float> dt = now - lastTick;
@@ -2776,10 +3779,52 @@ static RE::UI_MESSAGE_RESULT IMenuProcessMessageHook(RE::IMenu* a_menu, RE::UIMe
 	// Gdy otwarta konsola lub menu kreatora – nie uruchamiamy UpdateGraphs ani kolejek (unika CTD przy help / additem).
 	const char* menuName = a_menu ? a_menu->GetName() : nullptr;
 	if (menuName) {
-		if (std::strstr(menuName, "CharGen") || std::strstr(menuName, "Look") || std::strstr(menuName, "Face")) {
-			return result;
+		// DEBUG: Loguj wszystkie menu do diagnostyki
+		SAF_LOG_INFO("GraphManager: Menu detected: '{}'", menuName);
+		
+		// Wykryj wyjście do menu głównego - zresetuj SAF
+		static bool wasInGame = false;
+		static std::chrono::steady_clock::time_point lastResetTime;
+		static std::chrono::steady_clock::time_point lastLoadCheckTime;
+		static bool loadCheckScheduled = false;
+		
+		if (std::strcmp(menuName, "Main Menu") == 0 || std::strcmp(menuName, "MainMenu") == 0 ||
+			std::strcmp(menuName, "MainMenuMenu") == 0 || std::strcmp(menuName, "LoadingMenu") == 0) {
+			SAF_LOG_INFO("GraphManager: Main menu detected: '{}', wasInGame={}", menuName, wasInGame);
+			if (wasInGame) {
+				auto now = std::chrono::steady_clock::now();
+				// Resetuj tylko jeśli minęły co najmniej 2 sekundy od ostatniego resetu
+				if (now - lastResetTime > std::chrono::seconds(2)) {
+					SAF_LOG_INFO("GraphManager: Menu '{}' detected - performing full SAF reset", menuName);
+					auto* mgr = Animation::GraphManager::GetSingleton();
+					if (mgr) mgr->Reset();
+					Animation::Face::Manager::GetSingleton()->Reset();
+					Papyrus::EventManager::GetSingleton()->Reset();
+					Papyrus::SAFScript::RebindAfterLoad();
+					lastResetTime = now;
+					// Zaplanuj sprawdzenie wczytania za 5 sekund
+					loadCheckScheduled = true;
+					lastLoadCheckTime = now;
+				}
+			}
+			wasInGame = false;
+		} else if (std::strcmp(menuName, "Console") != 0 && std::strcmp(menuName, "LoadingMenu") != 0) {
+			SAF_LOG_INFO("GraphManager: Game menu detected: '{}', wasInGame={}, loadCheckScheduled={}", menuName, wasInGame, loadCheckScheduled);
+			// Jakiekolwiek inne menu niż konsola i loading oznacza, że jesteśmy w grze
+			if (!wasInGame) {
+				// Wracamy do gry z menu - sprawdź, czy trzeba rebindować Papyrus
+				auto now = std::chrono::steady_clock::now();
+				if (loadCheckScheduled && now - lastLoadCheckTime > std::chrono::seconds(3)) {
+					SAF_LOG_INFO("GraphManager: Returned from menu - ensuring Papyrus is rebound");
+					Papyrus::SAFScript::RebindAfterLoad();
+					loadCheckScheduled = false;
+				}
+			}
+			wasInGame = true;
 		}
-		if (std::strstr(menuName, "Console")) {
+		
+		// Blokuj UpdateGraphs tylko dla PhotoModeMenu aby uniknąć crash przy wyjściu z trybu zdjęć
+		if (menuName && std::strstr(menuName, "PhotoMode")) {
 			return result;
 		}
 	}
@@ -2860,16 +3905,98 @@ static RE::UI_MESSAGE_RESULT IMenuProcessMessageHook(RE::IMenu* a_menu, RE::UIMe
 	static std::atomic<uint32_t> callCount{ 0 };
 	const uint32_t callNum = ++callCount;
 		const auto now = std::chrono::steady_clock::now();
-		const std::chrono::duration<float> dt = now - lastTick;
+		std::chrono::duration<float> dt = now - lastTick;
 		lastTick = now;
+		// Clamp dt to prevent animation stutter from frame-time spikes.
+		// Max 50ms (~20fps equivalent) — allows up to 3 consecutive dropped 60fps
+		// frames before we start limiting. Bez dolnego clampa – ta wartość służy
+		// głównie jako fallback w UpdateGraphs, a dolny floor na każdym wywołaniu
+		// powodował przyspieszanie animacji przy wielokrotnym pompowaniu w jednej
+		// klatce (patrz komentarz przy clampie w UpdateGraphs).
+		if (dt.count() > 0.05f) dt = std::chrono::duration<float>(0.05f);
+
+		// Proste śledzenie VM - wykrywaj zmianę VM w każdej klatce
+		static RE::BSScript::Internal::VirtualMachine* lastVM = nullptr;
+		static std::chrono::steady_clock::time_point lastRebindTime;
+		
+		auto* currentVM = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+		
+		// Jeśli VM się zmieniło (wczytano nowy zapis), zrebinduj Papyrus
+		if (currentVM && currentVM != lastVM) {
+			auto now = std::chrono::steady_clock::now();
+			// Ogranicz rebindy do co 5 sekund minimum
+			if (now - lastRebindTime > std::chrono::seconds(5)) {
+				SAF_LOG_INFO("TaskUpdateLoop: VM changed from {:p} to {:p} - rebinding Papyrus", 
+					static_cast<void*>(lastVM), static_cast<void*>(currentVM));
+				Papyrus::SAFScript::RebindAfterLoad();
+				lastVM = currentVM;
+				lastRebindTime = now;
+			}
+		} else if (!lastVM && currentVM) {
+			// Pierwsze inicjalizacja VM
+			lastVM = currentVM;
+			lastRebindTime = std::chrono::steady_clock::now();
+		}
 
 	auto* mgr = GraphManager::GetSingleton();
 	const DWORD curThread = GetCurrentThreadId();
+
+	// Jak kopia 116236: najpierw ustal główny wątek, dopiero potem sprawdzaj save/load.
+	// Sprawdzanie player3D z wielu wątków jednocześnie (bez filtru isMainThread) może
+	// powodować race condition podczas wczytywania zapisu → crash.
 	if (g_mainThreadId == 0 && g_taskLoopAssumeMainThread.load(std::memory_order_acquire)) {
 		g_mainThreadId = curThread;
 		SAF_LOG_INFO("GraphManager: main thread id set to {} (TaskUpdateLoop)", g_mainThreadId);
 	}
 	const bool isMainThread = (g_mainThreadId != 0 && curThread == g_mainThreadId);
+	if (!isMainThread) {
+		return;
+	}
+
+	// Defer SAF updates while save/load is in progress.
+	// Flag is cleared in OnPostLoadGame (via SetSaveLoadInProgress(false)).
+	// We do NOT poll GetActor3DRootRaw (vtable[0xAC]) here – calling a virtual
+	// function on the player during active texture streaming can trigger a null-
+	// deref inside BSStreaming::ResourceUploader → CTD at Starfield.exe+2A462CF.
+	// g_actorGraphs is empty after Reset(false) called on kPreLoadGame, so
+	// UpdateGraphs is safe to run as soon as the flag is cleared.
+	static bool s_wasSaveLoadInProgress = false;
+	static bool s_pendingRebindAfterLoad = false;
+	static std::chrono::steady_clock::time_point s_saveLoadStartTime;
+	const bool isNowInProgress = g_saveLoadInProgress.load(std::memory_order_acquire);
+
+	if (isNowInProgress && !s_wasSaveLoadInProgress) {
+		s_saveLoadStartTime = std::chrono::steady_clock::now();
+		s_pendingRebindAfterLoad = true;
+	}
+	s_wasSaveLoadInProgress = isNowInProgress;
+
+	if (isNowInProgress) {
+		static std::atomic<uint32_t> waitLogCount{ 0 };
+		const uint32_t c = ++waitLogCount;
+		if (c <= 5 || c % 600 == 0) {
+			SAF_LOG_INFO("[TASK] save-load in progress, deferring UpdateGraphs (tick {})", c);
+		}
+
+		auto elapsed = std::chrono::steady_clock::now() - s_saveLoadStartTime;
+		if (elapsed > std::chrono::seconds(g_saveLoadAutoClearSeconds.load(std::memory_order_acquire))) {
+			SAF_LOG_WARN("[TASK] save-load in progress for >{}s, auto-clearing flag (OnPostLoadGame was likely never called)", g_saveLoadAutoClearSeconds.load(std::memory_order_acquire));
+			g_saveLoadInProgress.store(false, std::memory_order_release);
+			s_wasSaveLoadInProgress = false;
+			waitLogCount.store(0, std::memory_order_relaxed);
+		}
+
+		return;
+	}
+
+	// Save-load just completed (flag transitioned true -> false or was auto-cleared).
+	// Rebind Papyrus now even if VM pointer is the same — OnPostLoadGame's rebind
+	// may have fired before VM was ready, and VM pointer reuse disables auto-detect.
+	if (s_pendingRebindAfterLoad) {
+		SAF_LOG_INFO("[TASK] save-load completed, rebinding Papyrus native functions");
+		Papyrus::SAFScript::RebindAfterLoad();
+		s_pendingRebindAfterLoad = false;
+	}
 
 		const bool requested = Commands::SAFCommand::HasProcessRequest();
 		const bool hasPending = Commands::SAFCommand::HasPendingCommands();
@@ -2895,20 +4022,61 @@ static RE::UI_MESSAGE_RESULT IMenuProcessMessageHook(RE::IMenu* a_menu, RE::UIMe
 	}
 
 		if (mgr) {
+		// ── WATCHDOG: wykryj i napraw "zamrożone/trzęsące się" animacje ────────────
+		// Gdy grafy są aktywne, ale UpdateGraphs nie był pompowany przez dłuższy czas
+		// (zablokowany task loop / mutex / zawieszony wątek / utknięta flaga save-load),
+		// aktorzy zostają w półpozie i drżą. Pomijamy, gdy otwarta konsola/menu postaci –
+		// wtedy UpdateGraphs celowo nic nie robi (bezpieczniejsze, niż zrywanie animacji).
+		if (g_updateWatchdogEnabled.load(std::memory_order_acquire) && isMainThread && mgr->HasActiveGraphs()) {
+			bool uiBlocksUpdate = false;
+			if (auto* ui = RE::UI::GetSingleton()) {
+				uiBlocksUpdate = ui->IsMenuOpen("CharGenMenu") || ui->IsMenuOpen("LooksMenu") ||
+					ui->IsMenuOpen("FaceMenu") || ui->IsMenuOpen("Console");
+			}
+			if (!uiBlocksUpdate) {
+				const auto nowNs = std::chrono::steady_clock::now().time_since_epoch().count();
+				const std::int64_t lastNs = g_lastGraphUpdateNs.load(std::memory_order_acquire);
+				const float stallS = (lastNs > 0) ? static_cast<float>((nowNs - lastNs) / 1000000000.0) : 0.0f;
+				if (stallS > g_updateWatchdogTimeoutSeconds.load(std::memory_order_acquire)) {
+					// Warstwa obronna: ewentualnie utknięta flaga save-load, gdy task-loop
+					// wyszedł przed auto-clear (SaveLoadAutoClearSeconds). Czyścimy ją.
+					if (g_saveLoadInProgress.load(std::memory_order_acquire)) {
+						SAF_LOG_WARN("[WATCHDOG] save-load flag still set while graphs active (stall {:.1f}s) – forcing clear", stallS);
+						g_saveLoadInProgress.store(false, std::memory_order_release);
+					}
+					if (!g_watchdogStallLogged.load(std::memory_order_acquire)) {
+						g_watchdogStallLogged.store(true, std::memory_order_release);
+						g_watchdogStallStartNs.store(nowNs, std::memory_order_release);
+						SAF_LOG_WARN("[WATCHDOG] UpdateGraphs not pumping for {:.1f}s with {} active graph(s) – actors may appear frozen/shaking. Auto-recovery in ~{:.1f}s (disable via EnableUpdateWatchdog=0)",
+							stallS, mgr->HasActiveGraphs() ? 1 : 0, g_updateWatchdogForceReleaseSeconds.load(std::memory_order_acquire));
+					} else {
+						const std::int64_t startNs = g_watchdogStallStartNs.load(std::memory_order_acquire);
+						const float totalStall = (startNs > 0) ? static_cast<float>((nowNs - startNs) / 1000000000.0) : 0.0f;
+						if (totalStall > g_updateWatchdogForceReleaseSeconds.load(std::memory_order_acquire)) {
+							SAF_LOG_WARN("[WATCHDOG] stall exceeded {:.1f}s – force-releasing stuck animation(s) so actors return to game control", totalStall);
+							mgr->StopAllAnimations();
+							g_watchdogStallLogged.store(false, std::memory_order_release);
+						}
+					}
+				} else if (g_watchdogStallLogged.load(std::memory_order_acquire)) {
+					// Pompowanie wróciło do normy – zresetuj stan alarmu.
+					g_watchdogStallLogged.store(false, std::memory_order_release);
+				}
+			}
+		}
 		const bool allowUpdate = g_taskLoopAllowUpdateGraphs.load(std::memory_order_acquire);
 		const bool noOtherHook = !g_hookSeen.load(std::memory_order_acquire);
-		// Always run UpdateGraphs from Task when on main thread so animation advances every frame.
-		// (Preferring only the hook caused no updates when hook wasn't called for player -> frozen/upside-down pose.)
+		// Jak kopia 116236: task zawsze pompuje grafy gdy allowUpdate=1 lub brak innych hookow.
 		const bool shouldUpdate = isMainThread && (allowUpdate || noOtherHook);
 		if (shouldUpdate) {
 			if (!g_updateGuard.test_and_set(std::memory_order_acq_rel)) {
-				if (callNum <= 5 || callNum % 300 == 0) {
+				if (callNum <= 3 || callNum % 3600 == 0) {
 					SAF_LOG_INFO("[TASK] TaskUpdateLoop tick (dt={})", dt.count());
 				}
 				mgr->UpdateGraphs(dt.count());
 				g_updateGuard.clear(std::memory_order_release);
 			}
-		} else if (callNum <= 5 || callNum % 300 == 0) {
+		} else if (callNum <= 3 || callNum % 3600 == 0) {
 			SAF_LOG_INFO("[TASK] TaskUpdateLoop UpdateGraphs skipped (allow={}, noOtherHook={}, isMainThread={})",
 				allowUpdate ? "true" : "false",
 				noOtherHook ? "true" : "false",
@@ -2983,6 +4151,10 @@ static bool InstallAnimGraphManagerCallHook()
 
 	const int32_t rel = *reinterpret_cast<int32_t*>(callSite + 1);
 	const uintptr_t originalTarget = callSite + 5 + rel;
+	if (!IsInMainModule(reinterpret_cast<const void*>(originalTarget))) {
+		SAF_LOG_WARN("[HOOK] InstallAnimGraphManagerCallHook: original target {:X} outside main module - abort (CALL scan likely hit a false positive)", originalTarget);
+		return false;
+	}
 	g_originalAnimGraphManagerUpdate = reinterpret_cast<AnimGraphManagerUpdateFunc>(originalTarget);
 
 	SAF_LOG_INFO("[HOOK] InstallAnimGraphManagerCallHook: call site {:X}, original {:X}", callSite, originalTarget);
@@ -3066,7 +4238,13 @@ static bool InstallAnimGraphManagerCallHook()
 	{
 		LoadHookOverrideFromIni();
 		std::uint64_t id = g_modelDBGetEntryID.load(std::memory_order_acquire);
-		return id != 0 ? id : 949826;
+		return id != 0 ? id : 183072;
+	}
+
+	std::uint32_t GraphManager::GetModelDBGetEntryRVA()
+	{
+		// Legacy compatibility: GetEntry RVA override not currently exposed by GraphManager.
+		return 0;
 	}
 
 	std::uint64_t GraphManager::GetModelDBDecRefID()
@@ -3086,6 +4264,12 @@ static bool InstallAnimGraphManagerCallHook()
 	void GraphManager::InstallHooks()
 	{
 		LoadHookOverrideFromIni();
+
+	// Compose stamp instalujemy ZAWSZE (niezależnie od trybu pomp): hook BGSModelNode::Update
+	// (vtable slot 2) wpisuje pozę SAF do bufora rig tuż przed compose+commit silnika.
+	// Bez tego zapis SAF w zwykłej rozgrywce bywa nadpisywany przez fazę animacji silnika
+	// (objaw: animacja działa tylko w trybie fotograficznym).
+	InstallComposeHook();
 
 	if (!g_allowVtableHooks.load(std::memory_order_acquire)) {
 		SAF_LOG_INFO("Animation vtable hooks disabled");
@@ -3195,11 +4379,31 @@ static bool InstallAnimGraphManagerCallHook()
 			StartTaskUpdateLoop();
 		}
 
+		// Gdy TaskUpdateLoop aktywny: domyślnie SAF uzywa TYLKO PermanentTask - jak kopia 116236.
+		// AnimationHooksWithTaskLoop=1 instaluje hooki trampolinowe OBOK pętli: w zwykłej
+		// rozgrywce zapis SAF ląduje w fazie animacji silnika (po jego nadpisaniu), a pętla
+		// zadaniowa zostaje jako druga pompa (m.in. tryb foto, gdzie hooki mogą milczeć).
+		if (g_taskLoopEnabled.load(std::memory_order_acquire) &&
+			!g_animHooksWithTaskLoop.load(std::memory_order_acquire)) {
+			SAF_LOG_WARN("TaskUpdateLoop active: skipping AnimGraphManagerCall/GraphUpdate trampoline hooks");
+			return;
+		}
+
 		if (!g_animGraphManagerCallHookInstalled) {
 			if (InstallAnimGraphManagerCallHook()) {
 				g_debugHookLogs.store(200, std::memory_order_relaxed);
 				SAF_LOG_INFO("[HOOK] Debug: will log next {} hook calls", g_debugHookLogs.load());
 			}
+		}
+
+		// W trybie AnimationHooksWithTaskLoop GraphUpdateHook zostaje POMINIĘTY:
+		// jego trampolina kopiuje sztywno 14 B, a pierwsze instrukcje celu w 1.16.242
+		// (8D 60 01 | 48 D1 EA | 48 8B C5 | 48 2B C2 | 48 3B ..) kończą piątą instrukcję
+		// dopiero na 15. bajcie - ucięta instrukcja w trampolinie wywalała grę przy
+		// pierwszym wywołaniu (objaw: gra zamykała się przy wczytywaniu zapisu).
+		if (g_animHooksWithTaskLoop.load(std::memory_order_acquire)) {
+			SAF_LOG_INFO("[HOOK] AnimationHooksWithTaskLoop: GraphUpdateHook skipped (14-byte trampoline would cut instruction #5 of the 1.16.242 target); AnimGraphManagerCallHook is the pump");
+			return;
 		}
 
 		if (g_allowVtableHooks.load(std::memory_order_acquire) && !g_animGraphVtableHookInstalled) {
@@ -3285,11 +4489,18 @@ static bool InstallAnimGraphManagerCallHook()
 					if (std::filesystem::exists(gltf)) {
 						path = gltf;
 						resolved = true;
+					} else {
+						auto fbx = path;
+						fbx.replace_extension(".fbx");
+						if (std::filesystem::exists(fbx)) {
+							path = fbx;
+							resolved = true;
+						}
 					}
 				}
 				if (!resolved) {
-					s_lastLoadError = "File not found: " + path.string() + " (.glb/.gltf)";
-					SAF_LOG_ERROR("LoadAndStartAnimation: missing file '{}' (.glb/.gltf not found)", path.string());
+					s_lastLoadError = "File not found: " + path.string() + " (.glb/.gltf/.fbx)";
+					SAF_LOG_ERROR("LoadAndStartAnimation: missing file '{}' (.glb/.gltf/.fbx not found)", path.string());
 					return false;
 				}
 			} else if (!std::filesystem::exists(path)) {
@@ -3299,37 +4510,54 @@ static bool InstallAnimGraphManagerCallHook()
 			}
 			SAF_LOG_INFO("LoadAndStartAnimation: loading file '{}'", path.string());
 
-			auto asset = Serialization::GLTFImport::LoadGLTF(path);
-			if (!asset) {
-				const std::string& detail = Serialization::GLTFImport::GetLastGLTFLoadError();
-				s_lastLoadError = detail.empty() ? ("Failed to load GLTF: " + path.string()) : (path.string() + " - " + detail);
-				SAF_LOG_ERROR("LoadAndStartAnimation: failed to load GLTF '{}' - {}", path.string(), detail);
-				return false;
-			}
-			if (asset->asset.animations.empty()) {
-				s_lastLoadError = "GLTF has no animations: " + path.string();
-				SAF_LOG_WARN("LoadAndStartAnimation: GLTF has no animations");
-				return false;
-			}
-			size_t animIdx = static_cast<size_t>(std::max(0, a_animIndex));
-			if (animIdx >= asset->asset.animations.size()) animIdx = asset->asset.animations.size() - 1;
-			SAF_LOG_INFO("LoadAndStartAnimation: GLTF animations={}, using index {}, skeleton joints={}",
-				asset->asset.animations.size(), animIdx, skeleton->jointNames.size());
-
-			SAF_LOG_INFO("LoadAndStartAnimation: building raw animation");
-			auto rawAnim = Serialization::GLTFImport::CreateRawAnimation(
-				asset.get(),
-				&asset->asset.animations[animIdx],
-				skeleton->GetRawSkeleton(),
-				&skeleton->jointNames);
-			if (!rawAnim || !rawAnim->data) {
-				s_lastLoadError = "Failed to build raw animation (check bone names match skeleton).";
-				SAF_LOG_ERROR("LoadAndStartAnimation: failed to build raw animation");
-				return false;
-			}
-			SAF_LOG_INFO("LoadAndStartAnimation: raw animation built");
-
 			ozz::animation::offline::AnimationBuilder builder;
+			std::unique_ptr<Animation::RawOzzAnimation> rawAnim;
+			const bool isFBX = (path.extension() == ".fbx");
+
+		if (isFBX) {
+			// FBX plays through the IDENTICAL GLB pipeline: BuildWorldClip
+			// computes absolute game locals (world formula, fresh rest), then
+			// the shared builder, ClipGenerator, AttachGenerator and NAF
+			// writer below run unchanged (same as for .glb).
+			SAF_LOG_INFO("LoadAndStartAnimation: .fbx detected - building world clip (fresh rest, shared writer)");
+			rawAnim = Animation::FBXAnimationFile::BuildWorldClip(path.string(), skeleton, a_actor);
+			if (!rawAnim || !rawAnim->data) {
+				s_lastLoadError = "Failed to build FBX animation: " + path.string();
+				SAF_LOG_ERROR("LoadAndStartAnimation: failed to build FBX '{}'", path.string());
+				return false;
+			}
+		} else {
+				auto asset = Serialization::GLTFImport::LoadGLTF(path);
+				if (!asset) {
+					const std::string& detail = Serialization::GLTFImport::GetLastGLTFLoadError();
+					s_lastLoadError = detail.empty() ? ("Failed to load GLTF: " + path.string()) : (path.string() + " - " + detail);
+					SAF_LOG_ERROR("LoadAndStartAnimation: failed to load GLTF '{}' - {}", path.string(), detail);
+					return false;
+				}
+				if (asset->asset.animations.empty()) {
+					s_lastLoadError = "GLTF has no animations: " + path.string();
+					SAF_LOG_WARN("LoadAndStartAnimation: GLTF has no animations");
+					return false;
+				}
+				size_t animIdx = static_cast<size_t>(std::max(0, a_animIndex));
+				if (animIdx >= asset->asset.animations.size()) animIdx = asset->asset.animations.size() - 1;
+				SAF_LOG_INFO("LoadAndStartAnimation: GLTF animations={}, using index {}, skeleton joints={}",
+					asset->asset.animations.size(), animIdx, skeleton->jointNames.size());
+
+				SAF_LOG_INFO("LoadAndStartAnimation: building raw animation");
+				rawAnim = Serialization::GLTFImport::CreateRawAnimation(
+					asset.get(),
+					&asset->asset.animations[animIdx],
+					skeleton->GetRawSkeleton(),
+					&skeleton->jointNames);
+				if (!rawAnim || !rawAnim->data) {
+					s_lastLoadError = "Failed to build raw animation (check bone names match skeleton).";
+					SAF_LOG_ERROR("LoadAndStartAnimation: failed to build raw animation");
+					return false;
+				}
+				SAF_LOG_INFO("LoadAndStartAnimation: raw animation built");
+			}
+
 			SAF_LOG_INFO("LoadAndStartAnimation: building runtime animation");
 			auto runtimeAnim = builder(*rawAnim->data);
 			if (!runtimeAnim) {
@@ -3357,11 +4585,28 @@ static bool InstallAnimGraphManagerCallHook()
 				SAF_LOG_WARN("LoadAndStartAnimation: track/joint mismatch (tracks={}, joints={})", trackCount, jointCount);
 			}
 
-			SAF_LOG_INFO("LoadAndStartAnimation: creating ClipGenerator");
-			auto gen = std::make_unique<Animation::ClipGenerator>(skeleton, std::move(runtimeAnim));
-			if (auto* cg = gen.get()) cg->SetLooping(a_looping);
-			SAF_LOG_INFO("LoadAndStartAnimation: ClipGenerator created");
-			AttachGenerator(a_actor, std::move(gen), 0.0f);
+	SAF_LOG_INFO("LoadAndStartAnimation: creating ClipGenerator");
+	auto gen = std::make_unique<Animation::ClipGenerator>(skeleton, std::move(runtimeAnim));
+	if (auto* cg = gen.get()) {
+		cg->SetLooping(a_looping);
+		// Rest pose for the delta: file bind pose (GLB node TRS / FBX game
+		// rest). Without it the delta is computed against clip frame 0 and
+		// multi-actor / furniture scenes lose their absolute pose
+		// (actors hover above furniture or stand side by side).
+		if (rawAnim && !rawAnim->bindPose.empty())
+			cg->SetBindPose(rawAnim->bindPose);
+		// Up-axis space of this clip (GLB = Y-up, FBX world clip = game Z-up).
+		if (rawAnim) {
+			cg->SetNeedsYUpToZUp(rawAnim->needsYUpToZUpConversion);
+			SAF_LOG_INFO("LoadAndStartAnimation: yup2zup={} for '{}'",
+				rawAnim->needsYUpToZUpConversion ? 1 : 0, path.string());
+		}
+	}
+		SAF_LOG_INFO("LoadAndStartAnimation: ClipGenerator created");
+		// Mutual exclusion: stop any FBX animation on this actor so only the GLB
+		// writer drives the bones (same reason as the .fbx delegation above).
+		FBXGraphManager::GetSingleton()->Stop(a_actor);
+		AttachGenerator(a_actor, std::move(gen), 0.0f);
 			// Store which joints are animated by this clip; build joint map here so UpdateGraphs has valid state (deferring caused AV in UpdateGraphs at jointNames[i].c_str()).
 			{
 				std::lock_guard<std::mutex> lock(g_graphMutex);
@@ -3369,6 +4614,13 @@ static bool InstallAnimGraphManagerCallHook()
 				if (it != g_actorGraphs.end()) {
 					it->second.jointHasChannel = rawAnim->jointHasChannel;
 					it->second.currentAnimationPath = std::string(a_path);
+					{
+						float ox = 0.f, oy = 0.f, oz = 0.f;
+						LoadRootOffsetForClip(std::string(a_path), ox, oy, oz);
+						it->second.rootOffsetX = ox;
+						it->second.rootOffsetY = oy;
+						it->second.rootOffsetZ = oz;
+					}
 					if (!it->second.jointMapBuilt)
 						TryBuildJointMapAndCaptureState(a_actor, it->second);
 
@@ -3403,15 +4655,73 @@ static bool InstallAnimGraphManagerCallHook()
 								it->second.backupBoolFlags    = a_actor->boolFlags;
 								it->second.hadBoolFlagsBackup = true;
 							}
-							a_actor->boolBits.set(BB::kHeadingFixed);
-							a_actor->boolFlags.set(BF::kMovementBlocked);
-							a_actor->boolFlags.reset(BF::kSceneHeadtrackRotation);
-							SAF_LOG_INFO("LoadAndStartAnimation: NPC {:X} AI+movement blocked", a_actor->GetFormID());
+						a_actor->boolBits.set(BB::kHeadingFixed);
+						a_actor->boolFlags.set(BF::kMovementBlocked);
+						a_actor->boolFlags.reset(BF::kSceneHeadtrackRotation);
+						// OSF: boolFlags2.kAnimationDriven (bit 19) trzyma NPC w trybie
+						// animation-driven: AI gra animację, ale NIE ściąga kapsuły
+						// z powrotem na punkt pakietu (~4 u/s = "ucieczka" z mebla).
+						// Samo kMovementBlocked tego nie zatrzymuje.
+						a_actor->boolFlags2.set(RE::Actor::BOOL_FLAGS2::kAnimationDriven);
+						SAF_LOG_INFO("LoadAndStartAnimation: NPC {:X} AI+movement blocked", a_actor->GetFormID());
+						}
+
+						// Backup kąta i pozycji sprzed animacji — również z PrepareActorsForScene jeśli dostępny
+						auto itAB = g_pendingAngleBackup.find(a_actor->GetFormID());
+						if (itAB != g_pendingAngleBackup.end()) {
+							if (!it->second.hadAngleBackup) {
+								it->second.backupPosX   = itAB->second.posX;
+								it->second.backupPosY   = itAB->second.posY;
+								it->second.backupPosZ   = itAB->second.posZ;
+								it->second.backupAngleX = itAB->second.angX;
+								it->second.backupAngleY = itAB->second.angY;
+								it->second.backupAngleZ = itAB->second.angZ;
+								it->second.hadAngleBackup = true;
+							}
+							g_pendingAngleBackup.erase(itAB);
+							SAF_LOG_INFO("LoadAndStartAnimation: NPC {:X} using pre-block angle backup (angZ={:.4f})", a_actor->GetFormID(), it->second.backupAngleZ);
+						} else {
+							// Brak pending angle backup — zrób backup teraz
+							if (!it->second.hadAngleBackup) {
+								RE::NiPoint3 p = a_actor->GetPosition();
+								RE::NiPoint3 a = a_actor->GetAngle();
+								it->second.backupPosX   = p.x; it->second.backupPosY   = p.y; it->second.backupPosZ   = p.z;
+								it->second.backupAngleX = a.x; it->second.backupAngleY = a.y; it->second.backupAngleZ = a.z;
+								it->second.hadAngleBackup = true;
+								SAF_LOG_INFO("LoadAndStartAnimation: NPC {:X} angle backup saved now (angZ={:.4f})", a_actor->GetFormID(), a.z);
+							}
 						}
 					}
 				}
 			}
 			SAF_LOG_INFO("LoadAndStartAnimation: generator attached");
+			// UWAGA: przy starcie fazy NIE robimy SetPosition (cofnięte) —
+			// szarpało slave'ami przez pół pokoju na każdej zmianie fazy.
+			// Wizual trzyma pin co klatkę, kapsułą zarządza silnik/Ebanex.
+			{
+				// Phase-change diagnostics (Ebanex advances phases per actor):
+				// live root pos vs lock anchor right after attach, plus root
+				// local scale (wykrywa narastanie skali między scenami, np.
+				// rescale bez przywrócenia — wtedy druga scena wisi wyżej).
+				const RE::NiPoint3 live = a_actor->GetPosition();
+				const RE::NiPoint3 ang = a_actor->GetAngle();
+				float rootScale = 1.f;
+				(void)ReadRootLocalScale(GetActor3DRootRaw(a_actor), rootScale);
+				float visX = 0.f, visY = 0.f, visZ = 0.f;
+				const bool hasVis = ReadRootWorldPos(GetActor3DRootRaw(a_actor), visX, visY, visZ);
+				std::lock_guard<std::mutex> dlock(g_graphMutex);
+				auto dit = g_actorGraphs.find(a_actor->GetFormID());
+				if (dit != g_actorGraphs.end()) {
+					const auto& st = dit->second;
+					SAF_LOG_INFO("LoadAndStartAnimation: attached actor={:X} file='{}' live=({:.1f},{:.1f},{:.1f}) vis=({:.1f},{:.1f},{:.1f}) yaw={:.3f} anchor=({:.1f},{:.1f},{:.1f}) locked={} rootScale={:.3f}",
+						a_actor->GetFormID(), std::string(a_path),
+						live.x, live.y, live.z,
+						hasVis ? visX : -999.f, hasVis ? visY : -999.f, hasVis ? visZ : -999.f,
+						ang.z,
+						st.positionX, st.positionY, st.positionZ,
+						st.positionLocked ? 1 : 0, rootScale);
+				}
+			}
 			return true;
 		} catch (const std::exception& e) {
 			s_lastLoadError = std::string("Exception: ") + e.what();
@@ -3426,53 +4736,96 @@ static bool InstallAnimGraphManagerCallHook()
 
 	void GraphManager::DetachGenerator(RE::Actor* a_actor, float a_duration)
 	{
-		SAF_LOG_INFO("DetachGenerator: actor={}, duration={}",
-			static_cast<void*>(a_actor), a_duration);
 		if (!a_actor) return;
 		const RE::TESFormID id = a_actor->GetFormID();
-		std::lock_guard<std::mutex> lock(g_graphMutex);
-		auto it = g_actorGraphs.find(id);
-		if (it == g_actorGraphs.end()) {
-			SAF_LOG_WARN("DetachGenerator: no graph found for actor {:X}", id);
-			return;
-		}
+		REX::TEnumSet<RE::Actor::BOOL_BITS, std::uint32_t> backupBoolBits{};
+		bool hadBoolBits = false;
 
-		// Restore original game bone rotations before removing the graph
-		ActorGraphState& state = it->second;
-		const std::uintptr_t off = g_niTransformOffset.load(std::memory_order_acquire);
-		if (off != 0 && !state.gameBaseRotations.empty()) {
-			for (size_t i = 0; i < state.jointNodes.size() && i < state.gameBaseRotations.size(); ++i) {
-				RE::NiAVObject* node = state.jointNodes[i];
-				if (!node) continue;
-				const float* b = state.gameBaseRotations[i].data();
-				RestoreBoneRotationRaw(node, off, b);
-				if (i < state.gameBaseTranslations.size()) {
-					const float* t = state.gameBaseTranslations[i].data();
-					RestoreBoneTranslationRaw(node, off, t);
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			auto it = g_actorGraphs.find(id);
+			if (it == g_actorGraphs.end()) {
+				return;
+			}
+
+			// Restore original game bone rotations before removing the graph.
+			// TYLKO stawy, które SAF faktycznie animował (ShouldRestoreJointOnDetach).
+			// Reszta (twarz poza ustami, brzuch, wagina, dłonie/fizyka bez kanału)
+			// należy do gry – przywracanie ich ze snapshotu sprzed animacji
+			// nadpisałoby żywy stan FaceGen i twarz „zastygała” po animacji.
+			ActorGraphState& state = it->second;
+			const std::uintptr_t off = g_niTransformOffset.load(std::memory_order_acquire);
+			RE::NiAVObject* detachRoot = GetActor3DRootRaw(a_actor);
+			RE::NiAVObject* detachSkelRoot = state.jointNodes.empty() ? nullptr : state.jointNodes[0];
+			if (off != 0 && !state.gameBaseRotations.empty()) {
+				for (size_t i = 0; i < state.jointNodes.size() && i < state.gameBaseRotations.size(); ++i) {
+					if (!ShouldRestoreJointOnDetach(state, i, detachSkelRoot, detachRoot))
+						continue;
+					RE::NiAVObject* node = state.jointNodes[i];
+					if (!node) continue;
+					const float* b = state.gameBaseRotations[i].data();
+					RestoreBoneRotationRaw(node, off, b);
+					if (i < state.gameBaseTranslations.size()) {
+						const float* t = state.gameBaseTranslations[i].data();
+						RestoreBoneTranslationRaw(node, off, t);
+					}
 				}
 			}
-			SAF_LOG_INFO("DetachGenerator: bone transforms restored for actor {:X}", id);
-		}
 
-		// Odpowiednik SetRestrained(false) po animacji – przywróć boolBits/boolFlags
-		// zapisane przez LoadAndStartAnimation. Gracz (0x14) nie ma backupu (hadBoolBitsBackup=false),
-		// więc if-y go pomijają. Przy dwóch NPC każdy ma własny backup – obaj zostaną odblokowane.
-		if (state.hadBoolBitsBackup) {
-			a_actor->boolBits            = state.backupBoolBits;
-			state.hadBoolBitsBackup      = false;
-			SAF_LOG_INFO("DetachGenerator: boolBits (kHeadingFixed) restored for actor {:X}", id);
-		}
-		if (state.hadBoolFlagsBackup) {
-			a_actor->boolFlags           = state.backupBoolFlags;
-			state.hadBoolFlagsBackup     = false;
-			SAF_LOG_INFO("DetachGenerator: boolFlags restored for actor {:X}", id);
-		}
+			// Przywróć boolFlags natychmiast (kMovementBlocked, kSceneHeadtrackRotation).
+			if (state.hadBoolFlagsBackup) {
+				a_actor->boolFlags = state.backupBoolFlags;
+				state.hadBoolFlagsBackup = false;
+			}
+			// kAnimationDriven nigdy nie był w backupie (osobne pole boolFlags2):
+			// wyczyść zawsze, żeby NPC po scenie wrócił pod kontrolę AI.
+			a_actor->boolFlags2.reset(RE::Actor::BOOL_FLAGS2::kAnimationDriven);
 
-		g_actorGraphs.erase(it);
-		g_actorSequenceState.erase(id);
-		g_syncOwner.erase(id);
-		g_syncOwnerRootCache.erase(id);
-		SAF_LOG_INFO("DetachGenerator: graph removed for actor {:X}", id);
+			// Zapisz backupBoolBits – przywrócimy je po EvaluatePackage.
+			if (state.hadBoolBitsBackup) {
+				backupBoolBits = state.backupBoolBits;
+				hadBoolBits = true;
+				state.hadBoolBitsBackup = false;
+			}
+
+			// Pozycji i kąta CELWO nie przywracamy do backupu: pozycja ma się
+			// UTRZYMAĆ (tak jak chce reżyser sceny, np. Ebanex teleportujący
+			// między fazami). Przywracanie backupu ściągało aktorów z powrotem
+			// na miejsce sprzed sceny przy każdej zmianie fazy (Stop+Play) —
+			// faza 1 dobra, kolejne wisiały nad meblem. Kości i flagi AI
+			// przywracamy normalnie; sam backup tylko konsumujemy.
+			if (state.hadAngleBackup) {
+				state.hadAngleBackup = false;
+			}
+
+			ReleaseStampSlot(it->second);
+			g_actorGraphs.erase(it);
+			g_actorSequenceState.erase(id);
+			// NOTE: g_syncOwner / g_syncOwnerRootCache are intentionally NOT
+			// cleared here. Ebanex-style flows call StopAnimation + PlayOnActor
+			// on every phase change but SyncGraphs only once per scene — clearing
+			// sync on detach desyncs actors from phase 2 on (2nd actor stays at
+			// its own root ~1m away: floating / apart / swapped). The per-frame
+			// slave copy in UpdateGraphs re-applies sync on re-attach as long as
+			// both actors have live graphs (dead owners are skipped by lookup).
+			// Sync is explicitly cleared by StopSyncing, StopAllAnimations and
+			// Reset/FullReset.
+			g_pendingLockPosition.erase(id);
+		} // g_graphMutex released
+
+		// === Post-animation heading protection ===
+		// Przywracamy backupBoolBits (usuwa kHeadingFixed z czasów animacji),
+		// ale NATYCHMIAST zakładamy kHeadingFixed z powrotem na 4 klatki.
+		// To daje Havok capsule czas na zblendowanie z ostatniej pozy SAF
+		// do nowego ustawienia root NiNode. Po odblokowaniu AI przejmuje kontrolę.
+		using BB = RE::Actor::BOOL_BITS;
+		if (hadBoolBits) {
+			a_actor->boolBits = backupBoolBits;
+			// Zablokuj heading na 4 klatki, żeby Havok capsule zdążył się zsynchronizować.
+			a_actor->boolBits.set(BB::kHeadingFixed);
+			g_postAnimHeadingLock[id] = 4;
+			SAF_LOG_INFO("DetachGenerator: post-anim heading lock (4 frames) for {:X}", id);
+		}
 	}
 
 	// StopAnimation – called by "saf stop" console command.
@@ -3483,11 +4836,16 @@ static bool InstallAnimGraphManagerCallHook()
 			SAF_LOG_WARN("StopAnimation: actor is null");
 			return;
 		}
-		SAF_LOG_INFO("[STOP] StopAnimation: actor={:p}", static_cast<void*>(a_actor));
+		
+		// Remove actor from sync group
+		RemoveActorFromSyncGroup(a_actor->GetFormID());
+		
 		DetachGenerator(a_actor, 0.0f);
-		// UpdateWorldData so the renderer picks up the restored rotations immediately
 		SafeUpdateWorldData(a_actor, nullptr, nullptr);
-		SAF_LOG_INFO("[STOP] StopAnimation: done");
+		{
+			const RE::NiPoint3 curPos = a_actor->GetPosition();
+			a_actor->SetPosition(curPos, true);
+		}
 	}
 
 	void GraphManager::StopAllAnimations()
@@ -3507,24 +4865,52 @@ static bool InstallAnimGraphManagerCallHook()
 		for (RE::Actor* a : actorsToStop) {
 			StopAnimation(a);
 		}
+		// Explicit sync clear: DetachGenerator no longer clears g_syncOwner
+		// (phase-change persistence), so a global stop must clear it here.
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			g_syncOwner.clear();
+			g_syncOwnerRootCache.clear();
+		}
 	}
 
 	void GraphManager::SyncGraphs(const std::vector<RE::Actor*>& a_actors)
 	{
 		if (a_actors.empty()) return;
+		
+		// Collect form IDs
+		std::vector<RE::TESFormID> formIds;
+		for (RE::Actor* a : a_actors) {
+			if (a) formIds.push_back(a->GetFormID());
+		}
+		if (formIds.empty()) return;
+
+		// Create or get sync group for these actors
+		auto syncGroup = GetOrCreateSyncGroup(formIds);
+		if (!syncGroup) {
+			SAF_LOG_WARN("Failed to create sync group for {} actors", a_actors.size());
+			return;
+		}
+
+		// Legacy sync owner setup (keep for compatibility)
 		RE::TESFormID ownerId = a_actors[0]->GetFormID();
 		std::lock_guard<std::mutex> lock(g_graphMutex);
 		for (RE::Actor* a : a_actors) {
 			if (a) g_syncOwner[a->GetFormID()] = ownerId;
 		}
-		SAF_LOG_INFO("SyncGraphs: {} actors, owner={:X}", a_actors.size(), ownerId);
+		SAF_LOG_INFO("SyncGraphs: {} actors, owner={:X}, syncGroup created", a_actors.size(), ownerId);
 	}
 
 	void GraphManager::StopSyncing(RE::Actor* a_actor)
 	{
 		if (!a_actor) return;
-		std::lock_guard<std::mutex> lock(g_graphMutex);
 		RE::TESFormID id = a_actor->GetFormID();
+		
+		// Remove from new sync group system
+		RemoveActorFromSyncGroup(id);
+		
+		// Legacy sync owner cleanup (keep for compatibility)
+		std::lock_guard<std::mutex> lock(g_graphMutex);
 		RE::TESFormID ownerId = g_syncOwner[id];
 		g_syncOwner.erase(id);
 		g_syncOwnerRootCache.erase(id);
@@ -3553,7 +4939,7 @@ static bool InstallAnimGraphManagerCallHook()
 		}
 		LoadAndStartAnimation(a_actor, firstFile, firstLoop);
 		Papyrus::EventManager::GetSingleton()->DispatchPhaseBegin(a_actor, 0, firstFile);
-		SAF_LOG_INFO("StartSequence: actor={:X}, phases={}", id, numPhases);
+		SAF_LOG_INFO("StartSequence: actor={:X}, phases={}, first='{}'", id, numPhases, firstFile);
 	}
 
 	void GraphManager::AdvanceSequence(RE::Actor* a_actor, bool a_smooth)
@@ -3590,6 +4976,25 @@ static bool InstallAnimGraphManagerCallHook()
 			return;
 		}
 		LoadAndStartAnimation(a_actor, nextFile, nextLoop);
+		{
+			// Phase-change diagnostics: actor live pos vs lock anchor. If the 2nd
+			// actor floats above furniture from phase 2 on, this shows whether
+			// the root moved (teleport/stale anchor) or only the bones lifted.
+			const RE::NiPoint3 live = a_actor->GetPosition();
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			auto git = g_actorGraphs.find(id);
+			if (git != g_actorGraphs.end()) {
+				const auto& st = git->second;
+				SAF_LOG_INFO("AdvanceSequence: actor={:X} phase={} file='{}' live=({:.1f},{:.1f},{:.1f}) anchor=({:.1f},{:.1f},{:.1f}) locked={}",
+					id, nextPhaseIndex, nextFile,
+					live.x, live.y, live.z,
+					st.positionX, st.positionY, st.positionZ,
+					st.positionLocked ? 1 : 0);
+			} else {
+				SAF_LOG_INFO("AdvanceSequence: actor={:X} phase={} file='{}' live=({:.1f},{:.1f},{:.1f}) (no graph)",
+					id, nextPhaseIndex, nextFile, live.x, live.y, live.z);
+			}
+		}
 		Papyrus::EventManager::GetSingleton()->DispatchPhaseBegin(a_actor, nextPhaseIndex, nextFile);
 	}
 
@@ -3611,7 +5016,16 @@ static bool InstallAnimGraphManagerCallHook()
 		if (it != g_actorGraphs.end()) {
 			auto& state = it->second;
 			state.positionX = a_x; state.positionY = a_y; state.positionZ = a_z;
-			const RE::NiPoint3 ang = a_actor->GetAngle();
+			RE::NiPoint3 ang = a_actor->GetAngle();
+			// Jeśli PrepareActorsForScene ustawił pendingAngleZ, użyj go zamiast GetAngle().z.
+			// Gwarantuje to że state.angleZ = kąt aktora1 (sceny) a nie własny kąt NPC.
+			{
+				auto itAng = g_pendingAngleZ.find(id);
+				if (itAng != g_pendingAngleZ.end()) {
+					ang.z = itAng->second;
+					SAF_LOG_INFO("LockActorForAnimation: using pendingAngleZ={:.4f} for actor {:X}", ang.z, id);
+				}
+			}
 			state.angleX = ang.x; state.angleY = ang.y; state.angleZ = ang.z;
 			state.positionLocked = true;
 
@@ -3625,14 +5039,25 @@ static bool InstallAnimGraphManagerCallHook()
 				state.hadBoolFlagsBackup = true;
 			}
 
+			// Backup oryginalnego kąta i pozycji — przywrócone w DetachGenerator/UnlockActorAfterAnimation.
+			if (!state.hadAngleBackup) {
+				RE::NiPoint3 pos = a_actor->GetPosition();
+				state.backupPosX = pos.x; state.backupPosY = pos.y; state.backupPosZ = pos.z;
+				state.backupAngleX = state.angleX;
+				state.backupAngleY = state.angleY;
+				state.backupAngleZ = state.angleZ;
+				state.hadAngleBackup = true;
+			}
+
 			// Zablokuj heading i ruch: Actor::BOOL_BITS::kHeadingFixed, BOOL_FLAGS::kMovementBlocked.
 			using BB = RE::Actor::BOOL_BITS;
 			using BF = RE::Actor::BOOL_FLAGS;
-			a_actor->boolBits.set(BB::kHeadingFixed);
-			a_actor->boolFlags.set(BF::kMovementBlocked);
-			a_actor->boolFlags.reset(BF::kSceneHeadtrackRotation);
-		}
+		a_actor->boolBits.set(BB::kHeadingFixed);
+		a_actor->boolFlags.set(BF::kMovementBlocked);
+		a_actor->boolFlags.reset(BF::kSceneHeadtrackRotation);
+		a_actor->boolFlags2.set(RE::Actor::BOOL_FLAGS2::kAnimationDriven);
 	}
+}
 
 	void GraphManager::UnlockActorAfterAnimation(RE::Actor* a_actor)
 	{
@@ -3653,6 +5078,15 @@ static bool InstallAnimGraphManagerCallHook()
 			if (state.hadBoolFlagsBackup) {
 				a_actor->boolFlags = state.backupBoolFlags;
 				state.hadBoolFlagsBackup = false;
+			}
+			// kAnimationDriven nie jest w backupie — wyczyść jawnie, inaczej
+			// NPC zostanie animation-driven na stałe.
+			a_actor->boolFlags2.reset(RE::Actor::BOOL_FLAGS2::kAnimationDriven);
+			// Kąta i pozycji też nie przywracamy (patrz DetachGenerator):
+			// aktor zostaje tam, gdzie skończył animację / gdzie przestawił
+			// go reżyser. Sam backup konsumujemy.
+			if (state.hadAngleBackup) {
+				state.hadAngleBackup = false;
 			}
 		}
 	}
@@ -3723,6 +5157,17 @@ static bool InstallAnimGraphManagerCallHook()
 	{
 		if (!a_actor) return;
 		std::lock_guard<std::mutex> lock(g_graphMutex);
+		// Autorytatywna kotwica (Ebanex podaje współrzędne mebla) – zapisz trwale,
+		// nawet jeśli aktor nie jest jeszcze w grafie (wtedy AttachGenerator użyje
+		// tej kotwicy zamiast GetPosition).
+		{
+			auto& cache = g_anchorCache[a_actor->GetFormID()];
+			cache.x = a_x; cache.y = a_y; cache.z = a_z;
+			const RE::NiPoint3 ang = a_actor->GetAngle();
+			cache.ax = ang.x; cache.ay = ang.y; cache.az = ang.z;
+			cache.valid = true;
+			cache.authoritative = true;
+		}
 		auto it = g_actorGraphs.find(a_actor->GetFormID());
 		if (it != g_actorGraphs.end()) {
 			auto& state = it->second;
@@ -3738,6 +5183,8 @@ static bool InstallAnimGraphManagerCallHook()
 			state.angleY = ang.y;
 			state.angleZ = ang.z;
 		}
+		SAF_LOG_INFO("SetActorPosition: actor={:X} anchor=({:.2f},{:.2f},{:.2f}) (capsule seat queued)",
+			a_actor->GetFormID(), a_x, a_y, a_z);
 	}
 
 	// Odczytuje macierz rotacji world (NiMatrix3) z root node aktora.
@@ -3781,7 +5228,7 @@ static bool InstallAnimGraphManagerCallHook()
 		using BB = RE::Actor::BOOL_BITS;
 		using BF = RE::Actor::BOOL_FLAGS;
 
-		// Krok 1+2: zapisz backup i zablokuj każdego NPC.
+		// Krok 1+2: zapisz backup (flagi + kąt) i zablokuj każdego NPC.
 		for (RE::Actor* actor : { a_actor1, a_actor2 }) {
 			if (!actor || actor->GetFormID() == 0x14) continue;
 			{
@@ -3790,11 +5237,19 @@ static bool InstallAnimGraphManagerCallHook()
 				fb.bits  = actor->boolBits;
 				fb.flags = actor->boolFlags;
 				g_pendingFlagBackup[actor->GetFormID()] = fb;
+				// Backup oryginalnego kąta i pozycji sprzed blokady — DetachGenerator przywróci.
+				PendingAngleBackup ab;
+				RE::NiPoint3 p = actor->GetPosition();
+				RE::NiPoint3 a = actor->GetAngle();
+				ab.posX = p.x; ab.posY = p.y; ab.posZ = p.z;
+				ab.angX = a.x; ab.angY = a.y; ab.angZ = a.z;
+				g_pendingAngleBackup[actor->GetFormID()] = ab;
 			}
-			actor->boolBits.set(BB::kHeadingFixed);
-			actor->boolFlags.set(BF::kMovementBlocked);
-			actor->boolFlags.reset(BF::kSceneHeadtrackRotation);
-			SAF_LOG_INFO("PrepareActorsForScene: NPC {:X} AI+movement blocked, backup saved", actor->GetFormID());
+		actor->boolBits.set(BB::kHeadingFixed);
+		actor->boolFlags.set(BF::kMovementBlocked);
+		actor->boolFlags.reset(BF::kSceneHeadtrackRotation);
+		actor->boolFlags2.set(RE::Actor::BOOL_FLAGS2::kAnimationDriven);
+		SAF_LOG_INFO("PrepareActorsForScene: NPC {:X} AI+movement blocked, backup saved (pos+angle)", actor->GetFormID());
 		}
 
 		// Krok 3: ustaw pozycję i kąt – AI jest już zablokowane, nie nadpisze danych.
@@ -3810,7 +5265,10 @@ static bool InstallAnimGraphManagerCallHook()
 			if (!actor) continue;
 			actor->data.location = pos;
 			actor->data.angle    = ang;
-			actor->SetPosition(pos, false);
+			// updateCharController=true: kapsuła Havok teleportuje się razem
+			// z rootem, inaczej zostaje w tyle i silnik ściąga postać
+			// z powrotem (lewitacja / przeskoki nad meblem).
+			actor->SetPosition(pos, true);
 		}
 
 		// Krok 4: wpisz macierz yaw bezpośrednio do root NiNode (Z-up, obrót wokół Z).
@@ -3835,6 +5293,11 @@ static bool InstallAnimGraphManagerCallHook()
 			std::lock_guard<std::mutex> lock(g_graphMutex);
 			for (RE::Actor* actor : { a_actor1, a_actor2 }) {
 				if (!actor) continue;
+				// Autorytatywna kotwica sceny (Ebanex podaje pozycję mebla) – zapisz trwale.
+				auto& cache = g_anchorCache[actor->GetFormID()];
+				cache.x = pos.x; cache.y = pos.y; cache.z = pos.z;
+				cache.ax = ang.x; cache.ay = ang.y; cache.az = ang.z;
+				cache.valid = true; cache.authoritative = true;
 				auto it = g_actorGraphs.find(actor->GetFormID());
 				if (it != g_actorGraphs.end()) {
 					it->second.positionX = pos.x; it->second.positionY = pos.y; it->second.positionZ = pos.z;
@@ -3861,7 +5324,7 @@ static bool InstallAnimGraphManagerCallHook()
 		// Zaktualizuj ref targetu (data.location / data.angle) i pozycję w świecie.
 		a_target->data.location = pos;
 		a_target->data.angle = ang;
-		a_target->SetPosition(pos, false);
+		a_target->SetPosition(pos, true);
 
 		// KLUCZOWE: skopiuj macierz rotacji NiNode root node źródła bezpośrednio na target.
 		//
@@ -3970,6 +5433,7 @@ static bool InstallAnimGraphManagerCallHook()
 		}
 
 		// Poza mutexem: uruchom nową fazę na wszystkich aktorach w grupie.
+		SAF_LOG_INFO("SetSequencePhase: caller={:X} phase={} applying to {} actor(s)", callerId, a_phase, toApply.size());
 		for (const auto& p : toApply) {
 			RE::Actor* actor = RE::TESForm::LookupByID<RE::Actor>(p.id);
 			if (!actor && p.id == 0x14) {
@@ -3978,6 +5442,7 @@ static bool InstallAnimGraphManagerCallHook()
 			if (!actor) {
 				continue;
 			}
+			SAF_LOG_INFO("SetSequencePhase: actor={:X} -> '{}'", p.id, p.file);
 			LoadAndStartAnimation(actor, p.file, p.loop);
 			Papyrus::EventManager::GetSingleton()->DispatchPhaseBegin(actor, a_phase, p.file);
 		}
@@ -4050,7 +5515,50 @@ static bool InstallAnimGraphManagerCallHook()
 					const RE::NiPoint3 ang = a_actor->GetAngle();
 					angX = ang.x; angY = ang.y; angZ = ang.z;
 					lockPosition = true;
+					// Blokada sceny jest jednorazowa, a DetachGenerator kasuje stan grafu
+					// (razem z positionLocked) między klipami. Zapisz ją jako trwałą
+					// kotwicę, inaczej kolejne klipy biorą GetPosition() zdryfowanej
+					// kapsuły i para aktorów rozjeżdża się o ~0.2-0.6 m na klip.
+					auto& cache = g_anchorCache[id];
+					cache.x = posX; cache.y = posY; cache.z = posZ;
+					cache.ax = angX; cache.ay = angY; cache.az = angZ;
+					cache.valid = true;
+					cache.authoritative = true;
 					g_pendingLockPosition.erase(itPending);
+				}
+			}
+			// Trwała kotwica (Ebanex SetActorPosition / poprzedni pin): animacje 2.+
+			// w tej samej scenie mają tę samą kotwicę mebla. Bez tego GetPosition()
+			// zwracał zdryfowaną pozycję → aktor uciekał z mebla.
+			if (!lockPosition) {
+				auto itc = g_anchorCache.find(id);
+				if (itc != g_anchorCache.end() && itc->second.valid) {
+					// Autorytatywną kotwicę (SetActorPosition/PrepareActorsForScene) bierzemy
+					// bezwarunkowo. Kotwicę z pinu – tylko gdy aktor jest blisko niej
+					// (ta sama scena); daleko = nowa scena, weź świeżą GetPosition().
+					bool use = itc->second.authoritative;
+					const RE::NiPoint3 gp = a_actor->GetPosition();
+					const float ddx = gp.x - itc->second.x;
+					const float ddy = gp.y - itc->second.y;
+					const float ddz = gp.z - itc->second.z;
+					const float dist2 = ddx*ddx + ddy*ddy + ddz*ddz;
+					if (itc->second.authoritative) {
+						// Autorytatywna kotwica (mebel) bierzemy tylko gdy aktor jest
+						// praktycznie na niej. W przeciwnym razie (aktor przesunął się)
+						// użyj aktualnej pozycji, żeby nie przesuwać na stary anchor.
+						if (dist2 > (1.0f * 1.0f)) use = false;
+					} else {
+						// Reuse tylko gdy aktor jest bardzo blisko kotwicy (ta sama scena).
+						// Większy dryf = nowa pozycja (np. na meblu) -> użyj aktualnej pozycji.
+						use = (dist2 < (2.0f * 2.0f));
+					}
+					if (use) {
+						posX = itc->second.x; posY = itc->second.y; posZ = itc->second.z;
+						angX = itc->second.ax; angY = itc->second.ay; angZ = itc->second.az;
+						lockPosition = true;
+						SAF_LOG_INFO("AttachGenerator: reusing cached anchor for {:X} ({:.1f},{:.1f},{:.1f}) auth={}",
+							id, posX, posY, posZ, itc->second.authoritative);
+					}
 				}
 			}
 		}
@@ -4076,6 +5584,10 @@ static bool InstallAnimGraphManagerCallHook()
 		ActorGraphState state;
 		state.skeleton = skeleton;
 		state.generator = std::move(a_generator);
+		// Per-clip up-axis space for bone writes (NAF full-matrix and delta
+		// paths). Carried from the ClipGenerator so re-attached phases keep it.
+		if (auto* clipGen = dynamic_cast<Animation::ClipGenerator*>(state.generator.get()))
+			state.clipNeedsYUpToZUp = clipGen->NeedsYUpToZUp();
 		state.jointNodes.clear();
 		state.jointMapBuilt = false;
 		state.loggedFirstUpdate = false;
@@ -4084,6 +5596,11 @@ static bool InstallAnimGraphManagerCallHook()
 		state.positionLocked = lockPosition;
 		state.positionX = posX; state.positionY = posY; state.positionZ = posZ;
 		state.angleX = angX; state.angleY = angY; state.angleZ = angZ;
+		// Backup oryginalnej pozycji i kąta przed animacją — przywracane w DetachGenerator.
+		// Zapobiega chodzeniu do tyłu po zakończeniu animacji (AI dostaje prawidłowy kąt).
+		state.backupPosX = posX; state.backupPosY = posY; state.backupPosZ = posZ;
+		state.backupAngleX = angX; state.backupAngleY = angY; state.backupAngleZ = angZ;
+		state.hadAngleBackup = true;
 		state.blendGraphVariables = std::move(preservedVars);
 
 		if (auto* cg = dynamic_cast<Animation::ClipGenerator*>(state.generator.get()))
@@ -4092,16 +5609,66 @@ static bool InstallAnimGraphManagerCallHook()
 		SAF_LOG_INFO("AttachGenerator: joint map will be built in UpdateGraphs for actor={}", static_cast<void*>(a_actor));
 		g_debugHookLogs.store(120, std::memory_order_relaxed);
 
+		// Zanim nadpiszemy stary graph, przywróć stawy ruszane przez POPRZEDNIĄ
+		// animację z poprzedniego (prawidłowego) backupu TERAZ, zanim nowa
+		// animacja zdąży zmienić NiNode.
+		// Problem: LoadAndStartAnimation -> AttachGenerator NIE wywołuje DetachGenerator.
+		// gameBaseRotations są przechwytywane dopiero w UpdateGraphs/TryBuild (kilka klatek później),
+		// gdy animacja już działa -> backup nowej animacji byłby zepsuty.
+		// WAŻNE: przywracamy TYLKO stawy, które stara animacja faktycznie ruszała
+		// (ShouldRestoreJointOnDetach na starym stanie). W szczególności NIE ruszamy
+		// kości twarzy spoza ust ani innych stawów pod kontrolą gry – gra mogła je
+		// zmienić w trakcie starej animacji (FaceGen), a nadpisanie ich starym
+		// snapshotem „zastygało” wyraz twarzy.
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			auto itOld = g_actorGraphs.find(id);
+			if (itOld != g_actorGraphs.end()) {
+				const ActorGraphState& oldState = itOld->second;
+				const std::uintptr_t off = g_niTransformOffset.load(std::memory_order_acquire);
+				if (off != 0 && !oldState.gameBaseRotations.empty()) {
+					RE::NiAVObject* oldSkelRoot = oldState.jointNodes.empty() ? nullptr : oldState.jointNodes[0];
+					RE::NiAVObject* oldActorRoot = GetActor3DRootRaw(a_actor);
+					size_t restored = 0;
+					for (size_t si = 0; si < oldState.jointNodes.size() && si < oldState.gameBaseRotations.size(); ++si) {
+						if (!ShouldRestoreJointOnDetach(oldState, si, oldSkelRoot, oldActorRoot))
+							continue;
+						RE::NiAVObject* node = oldState.jointNodes[si];
+						if (!node) continue;
+						RestoreBoneRotationRaw(node, off, oldState.gameBaseRotations[si].data());
+						if (si < oldState.gameBaseTranslations.size()) {
+							RestoreBoneTranslationRaw(node, off, oldState.gameBaseTranslations[si].data());
+						}
+						++restored;
+					}
+					if (restored > 0)
+						SAF_LOG_INFO("AttachGenerator: pre-restored {} animated bones before new anim for actor {:X}", restored, id);
+				}
+			}
+		}
+
 		{
 			std::lock_guard<std::mutex> lock(g_graphMutex);
 			SAF_LOG_INFO("AttachGenerator: storing graph state");
-			g_actorGraphs[id] = std::move(state);
+			// Phase re-attach overwrites the previous state: release its stamp
+			// slot first, otherwise every phase leaks one of 64 slots and once
+			// exhausted the compose stamp stops publishing (pose snaps back to
+			// game pose mid-session).
+			if (auto itOld = g_actorGraphs.find(id); itOld != g_actorGraphs.end())
+				ReleaseStampSlot(itOld->second);
+			g_actorGraphs.insert_or_assign(id, std::move(state));
+			// WATCHDOG: świeży heartbeat od razu po attachu – unika fałszywego alarmu,
+			// gdy poprzednia sesja zostawiła stary znacznik czasu.
+			g_lastGraphUpdateNs.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
 		}
 		SAF_LOG_INFO("AttachGenerator: graphs now={}", g_actorGraphs.size());
+		// (Dosadzenie kapsuły robi LoadAndStartAnimation po doczytaniu offsetu
+		// z RootOffsets.ini — tutaj jeszcze go nie zna.)
 	g_rebindOnNextHook.store(true, std::memory_order_release);
 	g_forceUpdate.store(true, std::memory_order_release);
-		SAF_LOG_INFO("AttachGenerator: actor={}, transition={}s, joints={}",
-			static_cast<void*>(a_actor), a_transitionTime, skeleton->jointNames.size());
+		SAF_LOG_INFO("AttachGenerator: actor={}, transition={}s, joints={}, locked={} anchor=({:.1f},{:.1f},{:.1f})",
+			static_cast<void*>(a_actor), a_transitionTime, skeleton->jointNames.size(),
+			state.positionLocked ? 1 : 0, state.positionX, state.positionY, state.positionZ);
 	}
 
 void GraphManager::RequestGraphUpdate()
@@ -4120,6 +5687,43 @@ bool GraphManager::ShouldDeferHookInstall() const
 	LoadHookOverrideFromIni();
 	return g_hookOverrideRva.load(std::memory_order_acquire) != 0;
 }
+
+	void GraphManager::SetSaveLoadInProgress(bool a_inProgress)
+	{
+		g_saveLoadInProgress.store(a_inProgress, std::memory_order_release);
+		if (a_inProgress) {
+			// Nie ruszaj g_skipFirstNHookCalls tutaj — PostDataLoad/PreLoadGame potrafią wołać często
+			// i reset licznika zatrzymywał hook w nieskończonej „pętli skip” (brak animacji).
+			SAF_LOG_INFO("GraphManager: save-load in progress");
+		} else {
+			SAF_LOG_INFO("GraphManager: save-load completed");
+		}
+	}
+
+	bool GraphManager::IsSaveLoadInProgress() const
+	{
+		return g_saveLoadInProgress.load(std::memory_order_acquire);
+	}
+
+	void GraphManager::ApplyRevertLoadSkipGuard()
+	{
+		const uint32_t cfg = g_skipFirstNHookCallsConfig.load(std::memory_order_acquire);
+		const uint32_t n = cfg > 64u ? 64u : cfg;
+		g_skipFirstNHookCalls.store(n, std::memory_order_release);
+		SAF_LOG_INFO("ApplyRevertLoadSkipGuard: SkipFirst={} (INI cap 64)", n);
+	}
+
+	bool GraphManager::IsPrimaryGraphPumpActive()
+	{
+		if (g_animGraphManagerCallHookInstalled || g_graphUpdateHookInstalled ||
+			g_animGraphUpdateHookInstalled || g_animGraphVtableHookInstalled) {
+			return true;
+		}
+		return g_taskLoopStarted.load(std::memory_order_acquire) &&
+		       g_taskLoopEnabled.load(std::memory_order_acquire) &&
+		       g_taskLoopAllowUpdateGraphs.load(std::memory_order_acquire) &&
+		       !g_animGraphManagerCallHookInstalled;
+	}
 
 	void GraphManager::SetMainThreadId(std::uint32_t a_threadId)
 	{
@@ -4140,14 +5744,288 @@ bool GraphManager::ShouldDeferHookInstall() const
 		return g_mainThreadId != 0 && curThread == g_mainThreadId;
 	}
 
+	// Thread-local cache dla wektorów używanych per-frame w UpdateGraphs.
+	// Unika alokacji/dealokacji pamięci na każdej klatce dla każdego aktora.
+	struct UpdateGraphsCache {
+		std::vector<RE::NiAVObject*> modifiedBones;
+		std::vector<std::pair<RE::TESFormID, ActorGraphState*>> updateOrder;
+		void Clear() {
+			modifiedBones.clear();
+			updateOrder.clear();
+		}
+	};
+	static thread_local UpdateGraphsCache s_tlCache;
+
+	// ── Compose stamp (OSF-style) — helpers ───────────────────────────────────────
+	// osf-animation pisze pozę do płaskiego bufora rig->local->data (16 floatów na kość,
+	// layout NiTransform: 3 wiersze po 4 floaty, translacja +0x30, skala +0x3C) w hooku
+	// BGSModelNode::Update (vtable slot 2, funkcja ID 48634) TUŻ przed compose+commit
+	// silnika. To jedyny zapis, którego silnik nie nadpisuje w zwykłej rozgrywce —
+	// dlatego animacja działa deterministycznie (nie tylko w trybie foto).
+	static constexpr std::uintptr_t kModelNodeRigBoneCountOffset = 0x78;
+
+	static std::uint16_t GetRigBoneCountRaw(const RE::BGSModelNode* a_modelNode)
+	{
+		return *reinterpret_cast<const std::uint16_t*>(
+			reinterpret_cast<std::uintptr_t>(a_modelNode) + kModelNodeRigBoneCountOffset);
+	}
+
+	// 3D root aktora to BSFadeNode (vtable 472039) — walidacja przez vtable, bo commonlibsf
+	// nie ma AsFadeNode(); typ sprawdzamy zanim rzutujemy wskaźnik.
+	static bool IsBSFadeNodeRaw(const RE::NiAVObject* a_obj)
+	{
+		if (!a_obj) return false;
+		__try {
+			const void* vt = *reinterpret_cast<void* const*>(a_obj);
+			for (const auto id : RE::VTABLE::BSFadeNode) {
+				REL::Relocation<std::uintptr_t> vtbl{ id };
+				if (reinterpret_cast<std::uintptr_t>(vt) == vtbl.address()) return true;
+			}
+			return false;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// SEH: bgsModelNode z BSFadeNode (może AV przy śmieciowym wskaźniku po rebudowie 3D).
+	static RE::BGSModelNode* GetModelNodeFromFadeNodeRaw(RE::NiAVObject* a_root)
+	{
+		__try {
+			return reinterpret_cast<RE::BSFadeNode*>(a_root)->bgsModelNode.get();
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return nullptr;
+		}
+	}
+
+	// SEH: surowe odczyty żywotności bufora rig (rig/local/data + liczniki).
+	static bool ReadModelNodeRaw(RE::BGSModelNode* a_modelNode,
+		void** a_outLocalData, std::uint32_t* a_outNodeCount, std::uint16_t* a_outRigBones)
+	{
+		__try {
+			RE::BGSModelNode::Rig* rig = a_modelNode->rig;
+			if (!rig || !rig->local || !rig->local->data) return false;
+			*a_outLocalData = rig->local->data;
+			*a_outNodeCount = a_modelNode->nodes.size();
+			*a_outRigBones = GetRigBoneCountRaw(a_modelNode);
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	struct RawNodeEntry { RE::NiAVObject* node; std::uint16_t rigIndex; };
+
+	// SEH: kopiuje modelNode->nodes do tablicy POD (binding budujemy poza SEH).
+	static std::uint32_t CopyNodeEntriesRaw(RE::BGSModelNode* a_modelNode, RawNodeEntry* a_out, std::uint32_t a_cap)
+	{
+		__try {
+			const std::uint32_t n = a_modelNode->nodes.size();
+			const std::uint32_t m = (n < a_cap) ? n : a_cap;
+			for (std::uint32_t i = 0; i < m; ++i) {
+				a_out[i].node = a_modelNode->nodes[i].node;
+				a_out[i].rigIndex = a_modelNode->nodes[i].rigIndex;
+			}
+			return n;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return 0;
+		}
+	}
+
+	// Buduje binding jointIndex→rigIndex: dla każdego wpisu w modelNode->nodes szukamy tego
+	// samego wskaźnika węzła w jointNodes (SAF animuje dokładnie te węzły). Pierwszy wpis
+	// dla danego jointu wygrywa (duplikaty typu L_Wrist w HumanRace.json).
+	static bool BuildStampBinding(ActorGraphState& a_state, RE::BGSModelNode* a_modelNode)
+	{
+		void* localData = nullptr;
+		std::uint32_t nodeCount = 0;
+		std::uint16_t rigBones = 0;
+		if (!ReadModelNodeRaw(a_modelNode, &localData, &nodeCount, &rigBones)) return false;
+		if (nodeCount == 0 || nodeCount > 4096 || rigBones == 0 || rigBones > 4096) return false;
+
+		std::vector<RawNodeEntry> entries(nodeCount);
+		if (CopyNodeEntriesRaw(a_modelNode, entries.data(), nodeCount) != nodeCount) return false;
+
+		std::unordered_map<const RE::NiAVObject*, std::uint16_t> nodeToJoint;
+		nodeToJoint.reserve(a_state.jointNodes.size());
+		for (std::size_t i = 0; i < a_state.jointNodes.size(); ++i) {
+			if (a_state.jointNodes[i]) nodeToJoint.emplace(a_state.jointNodes[i], static_cast<std::uint16_t>(i));
+		}
+
+		std::vector<std::uint8_t> jointBound(a_state.jointNodes.size(), 0);
+		std::vector<std::pair<std::uint16_t, std::uint16_t>> built;
+		for (const auto& e : entries) {
+			if (!e.node || e.rigIndex >= rigBones) continue;
+			const auto it = nodeToJoint.find(e.node);
+			if (it == nodeToJoint.end() || it->second >= jointBound.size()) continue;
+			if (jointBound[it->second]) continue;
+			jointBound[it->second] = 1;
+			built.push_back({ it->second, e.rigIndex });
+		}
+
+		if (built.empty()) {
+			// Bez dopasowanych slotów nie commitujemy tożsamości — inaczej StampCompose
+			// pisałby po staremu, a pętla próbowałaby bindu w kółko bez efektu.
+			a_state.stampBinding.clear();
+			a_state.stampModelNode = nullptr;
+			a_state.stampLocalData = nullptr;
+			a_state.stampNodeCount = 0;
+			a_state.stampRigBoneCount = 0;
+			return false;
+		}
+
+		a_state.stampBinding = std::move(built);
+		a_state.stampModelNode = a_modelNode;
+		a_state.stampLocalData = localData;
+		a_state.stampNodeCount = nodeCount;
+		a_state.stampRigBoneCount = rigBones;
+		return true;
+	}
+
+	// SEH: read-back 16 floatów, które SAF przed chwilą zapisał do node->local (ten sam wątek,
+	// nic pomiędzy zapisem a odczytem) — dokładnie te wartości trafią do bufora rig.
+	static bool CaptureStampSlotRaw(ActorGraphState& a_state, std::size_t a_jointIdx)
+	{
+		const std::uintptr_t off = g_niTransformOffset.load(std::memory_order_acquire);
+		if (!off || a_jointIdx >= a_state.stampPose.size()) return false;
+		__try {
+			const float* p = reinterpret_cast<const float*>(
+				reinterpret_cast<const std::uint8_t*>(a_state.jointNodes[a_jointIdx]) + off);
+			std::memcpy(a_state.stampPose[a_jointIdx].data(), p, 16 * sizeof(float));
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// SEH: zapis 16 floatów do slotu bufora rig (rigIdx * 16 floatów, layout NiTransform).
+	static bool WriteStampSlotRaw(void* a_buf, std::uint16_t a_rigIdx, const float* a_src)
+	{
+		__try {
+			std::memcpy(reinterpret_cast<float*>(a_buf) + static_cast<std::size_t>(a_rigIdx) * 16,
+				a_src, 16 * sizeof(float));
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// ── Lock-free compose stamp ────────────────────────────────────────────────
+	// StampCompose biega na wątkach RÓWNOLEGŁYCH silnika (BGSModelNode::Update), a pompa
+	// (UpdateGraphs) trzyma g_graphMutex przez całą pętlę apply. Wcześniej stamp brał
+	// try_lock(g_graphMutex) — przegrywał wyścig w większości klatek, silnik nadpisywał
+	// pozę i widać było przeskoki do pozy sprzed animacji. Teraz pompa (jedyne miejsce
+	// pod mutexem) publikuje niezmienną migawkę do slotu atomic<shared_ptr>, a compose
+	// czyta ją bez żadnego locka: shared_ptr trzyma dane żywe podczas odczytu, migawka
+	// nigdy nie jest mutowana po publikacji.
+	struct StampSnapshot
+	{
+		RE::BGSModelNode* modelNode = nullptr;
+		const void* localData = nullptr;
+		std::uint32_t nodeCount = 0;
+		std::uint16_t rigBoneCount = 0;
+		std::vector<std::pair<std::uint16_t, std::uint16_t>> binding;  // (jointIndex, rigIndex)
+		std::vector<std::array<float, 16>> pose;   // per jointIndex
+		std::vector<std::uint8_t> valid;           // per jointIndex
+	};
+	constexpr std::size_t kStampSlotCount = 64;
+	constexpr std::size_t kInvalidStampSlot = static_cast<std::size_t>(-1);
+	static std::array<std::atomic<std::shared_ptr<const StampSnapshot>>, kStampSlotCount> g_stampSlots;
+
+	// Zwalnia slot migawki aktora. Wołane WYŁĄCZNIE pod g_graphMutex (pompa/stop/reset).
+	static void ReleaseStampSlot(ActorGraphState& a_state)
+	{
+		if (a_state.stampSlot != kInvalidStampSlot) {
+			g_stampSlots[a_state.stampSlot].store(nullptr, std::memory_order_release);
+			a_state.stampSlot = kInvalidStampSlot;
+		}
+	}
+
+	// Publikuje migawkę pozy z state do slotu lock-free. Wołane z pompy pod g_graphMutex.
+	static void PublishStampSnapshot(ActorGraphState& a_state)
+	{
+		if (!a_state.stampModelNode) return;
+
+		// Staleness: tabela węzłów / bufor rig mogły się mutować (patche widoczności hełmu
+		// przetasowują sloty) — przebuduj binding ZANIM migawka pojedzie ze starą tożsamością.
+		void* localData = nullptr;
+		std::uint32_t nodeCount = 0;
+		std::uint16_t rigBones = 0;
+		if (ReadModelNodeRaw(a_state.stampModelNode, &localData, &nodeCount, &rigBones)) {
+			if (localData != a_state.stampLocalData || nodeCount != a_state.stampNodeCount ||
+				rigBones != a_state.stampRigBoneCount) {
+				const auto prevNodes = a_state.stampNodeCount;
+				const auto prevBones = a_state.stampRigBoneCount;
+				if (!BuildStampBinding(a_state, a_state.stampModelNode)) {
+					a_state.stampModelNode = nullptr;  // self-heal: re-solve z pętli UpdateGraphs
+					a_state.stampFadeNode = nullptr;
+					ReleaseStampSlot(a_state);
+					static std::atomic<std::uint32_t> s_pubRebindFail{ 0 };
+					if (s_pubRebindFail++ < 5)
+						SAF_LOG_WARN("[COMPOSE] rebind failed after node-table mutation (nodes {} -> {}, rigBones {} -> {}); stamp disabled until re-solve",
+							prevNodes, nodeCount, prevBones, rigBones);
+					return;
+				}
+				static std::atomic<std::uint32_t> s_pubRebind{ 0 };
+				if (s_pubRebind++ < 5)
+					SAF_LOG_INFO("[COMPOSE] REBIND after node-table mutation (nodes {} -> {}, rigBones {} -> {}, {} bones)",
+						prevNodes, nodeCount, prevBones, rigBones, a_state.stampBinding.size());
+			}
+		} else {
+			// modelNode umiera / rig nieczytelny — nie publikuj po śmieciach; re-solve
+			// nastąpi przy zmianie 3D root (blok rozwiązywania w UpdateGraphs).
+			return;
+		}
+		if (!a_state.stampModelNode) return;
+
+		if (a_state.stampPose.size() != a_state.jointNodes.size() ||
+			a_state.stampValid.size() != a_state.jointNodes.size()) {
+			return;
+		}
+
+		auto snap = std::make_shared<StampSnapshot>();
+		snap->modelNode = a_state.stampModelNode;
+		snap->localData = a_state.stampLocalData;
+		snap->nodeCount = a_state.stampNodeCount;
+		snap->rigBoneCount = a_state.stampRigBoneCount;
+		snap->binding = a_state.stampBinding;
+		snap->pose = a_state.stampPose;
+		snap->valid = a_state.stampValid;
+
+		if (a_state.stampSlot == kInvalidStampSlot) {
+			for (std::size_t i = 0; i < kStampSlotCount; ++i) {
+				if (!g_stampSlots[i].load(std::memory_order_acquire)) {
+					a_state.stampSlot = i;
+					break;
+				}
+			}
+			if (a_state.stampSlot == kInvalidStampSlot) {
+				static std::atomic<std::uint32_t> s_slotExhaust{ 0 };
+				if (s_slotExhaust++ < 5)
+					SAF_LOG_WARN("[COMPOSE] stamp slots exhausted ({}) - not publishing", kStampSlotCount);
+				return;
+			}
+		}
+		g_stampSlots[a_state.stampSlot].store(std::move(snap), std::memory_order_release);
+	}
+
 	void GraphManager::UpdateGraphs(float a_deltaSeconds)
 	{
+		s_tlCache.Clear();
 		const DWORD curThread = GetCurrentThreadId();
 		if (g_mainThreadId == 0 && curThread != 0) {
 			g_mainThreadId = curThread;
 			SAF_LOG_INFO("GraphManager: main thread id set to {} (UpdateGraphs self-healing)", g_mainThreadId);
 		}
 		if (!IsMainThread()) {
+			return;
+		}
+
+		if (g_saveLoadInProgress.load(std::memory_order_acquire)) {
+			static std::atomic<uint32_t> skipCount{ 0 };
+			const uint32_t c = ++skipCount;
+			if (c <= 5 || c % 300 == 0) {
+				SAF_LOG_INFO("[UPDATE] UpdateGraphs skipped - save/load in progress");
+			}
 			return;
 		}
 
@@ -4163,33 +6041,87 @@ bool GraphManager::ShouldDeferHookInstall() const
 
 		// Dla SAF używamy własnego delta (steady_clock), żeby prędkość odtwarzania była stosowana do rzeczywistego czasu.
 		// dt z gry (ReadAnimUpdateData) może być w złej jednostce/offsetcie i wtedy speed nic nie zmienia.
+		// (Wariant z wczesnym return przy „podwójnym" wywołaniu i twarde limicie 0.25 s powodował nieregularne kroki i pierwszą klatkę przy max dt.)
 		static std::chrono::steady_clock::time_point s_lastTick;
 		const auto now = std::chrono::steady_clock::now();
 		float dtToUse = std::chrono::duration<float>(now - s_lastTick).count();
-		if (dtToUse <= 0.0f || !std::isfinite(dtToUse) || dtToUse > 1.0f)
+		if (dtToUse <= 0.0f || !std::isfinite(dtToUse) || dtToUse > 0.25f)
 			dtToUse = a_deltaSeconds > 0.0f && std::isfinite(a_deltaSeconds) ? a_deltaSeconds : 0.016f;
+		// Clamp dt to prevent animation stutter from frame-time spikes.
+		// Max 50ms (~20fps equivalent). Celowo BRAK dolnego clampa (min floor):
+		// UpdateGraphs może być wołane kilka razy na jedną klatkę renderingu
+		// (wiele ścieżek pompujących + subdivided updates silnika – patrz FrameClock.h).
+		// Dolny clamp (np. min 8ms na wywołanie) sprawiał, że każde dodatkowe
+		// wywołanie w tej samej klatce dokładało pełne minimum – animacja szła
+		// szybciej niż czas rzeczywisty (widoczne zwłaszcza w trybie Photo,
+		// gdzie rozkład wywołań pompujących się zmienia). Bez floora kolejne
+		// wywołania w tej samej klatce dzielą rzeczywisty czas na ułamki,
+		// które sumują się poprawnie niezależnie od liczby pomp.
+		if (dtToUse > 0.05f) dtToUse = 0.05f;
+
+		// FBX pipeline (separate manager, independent actor map). Pumped on the same main-thread
+		// tick so FBX animations keep running even when no GLB graph is active.
+		FBXGraphManager::GetSingleton()->UpdateGraphs(dtToUse);
 
 		std::vector<RE::Actor*> sequenceAdvanceActors;
+		std::vector<RE::Actor*> finishedAnimActors;
+		// Capsule seats are applied OUTSIDE g_graphMutex: SetPosition can call
+		// back into game code that takes the same lock.
+		std::vector<std::pair<RE::Actor*, RE::NiPoint3>> capsuleSeatRequests;
+
+		// Post-animation heading lock: odliczaj klatki niezależnie od g_actorGraphs.
+		{
+			using BB = RE::Actor::BOOL_BITS;
+			for (auto it = g_postAnimHeadingLock.begin(); it != g_postAnimHeadingLock.end(); ) {
+				RE::Actor* actor = RE::TESForm::LookupByID<RE::Actor>(it->first);
+				if (!actor) {
+					it = g_postAnimHeadingLock.erase(it);
+					continue;
+				}
+				it->second--;
+				if (it->second <= 0) {
+					if (actor->GetFormID() != 0x14) {
+						actor->boolBits.reset(BB::kHeadingFixed);
+						SAF_LOG_INFO("[UPDATE] heading lock released for {:X}", it->first);
+					}
+					it = g_postAnimHeadingLock.erase(it);
+				} else {
+					++it;
+				}
+			}
+		}
+
 		{
 			std::lock_guard<std::mutex> lock(g_graphMutex);
+			const bool hasFbxActors = !FBXGraphManager::GetSingleton()->IsEmpty();
 			if (g_actorGraphs.empty()) {
 				static std::atomic<uint32_t> emptyGraphCount{ 0 };
 				uint32_t c = ++emptyGraphCount;
 				if (c <= 5 || c % 600 == 0) {
 					SAF_LOG_INFO("[UPDATE] UpdateGraphs: no active graphs");
 				}
+				if (!hasFbxActors)
+					return;
+				// Only FBX active: keep the shared clock running so FBX dt is
+				// real time. Without this s_lastTick froze at its old value,
+				// dtToUse fell back to the hook's subdivided micro-dt and FBX
+				// played ~25x slow motion (standing/shaking instead of dancing).
+				s_lastTick = now;  // tick mimo braku grafów GLB – pompa FBX żyje
+				g_lastGraphUpdateNs.store(now.time_since_epoch().count(), std::memory_order_release);
 				return;
 			}
 			s_lastTick = now;  // tick tylko gdy faktycznie aktualizujemy grafy
-
+			g_lastGraphUpdateNs.store(now.time_since_epoch().count(), std::memory_order_release);  // WATCHDOG: heartbeat – grafy faktycznie pompowane
 			static std::atomic<uint32_t> updateCount{ 0 };
 			const uint32_t ucount = ++updateCount;
-			// At most one BuildJointMap per frame to avoid 5–6 second freezes when several actors need setup
+			// Build joint maps for ALL actors in a scene at once (limit raised from 1).
+			// Old limit of 1 caused multi-actor scenes where actors 2+ would stand still
+			// for several frames while only actor 1 was animated.
 			int jointMapsBuiltThisFrame = 0;
-			constexpr int kMaxJointMapBuildsPerFrame = 1;
+			constexpr int kMaxJointMapBuildsPerFrame = 32;
 
 			// Kolejność jak w NAF: najpierw ownerzy (i aktorzy bez sync), potem slave’y – żeby cache root był wypełniony zanim slave go użyje.
-			std::vector<std::pair<RE::TESFormID, ActorGraphState*>> updateOrder;
+			auto& updateOrder = s_tlCache.updateOrder;
 			updateOrder.reserve(g_actorGraphs.size());
 			for (auto& kv : g_actorGraphs)
 				updateOrder.push_back({ kv.first, &kv.second });
@@ -4216,7 +6148,16 @@ bool GraphManager::ShouldDeferHookInstall() const
 				SAF_LOG_INFO("[UPDATE] UpdateGraphs: first update for actor={}, joints={}", id, state.skeleton->jointNames.size());
 			}
 
-			if (!state.jointMapBuilt && !state.jointMapBuildFailed) {
+			if (!state.jointMapBuilt) {
+				// Retry: jeśli wcześniej się nie udało, spróbuj ponownie po 30 klatkach
+				// (aktor mógł nie mieć jeszcze załadowanego 3D).
+				if (state.jointMapBuildFailed) {
+					if (state.animFrameCount < 30 || state.animFrameCount % 120 != 0) {
+						continue;
+					}
+					state.jointMapBuildFailed = false;
+					SAF_LOG_INFO("[UPDATE] UpdateGraphs: retrying joint map build for actor={} (frame={})", id, ucount);
+				}
 				if (jointMapsBuiltThisFrame >= kMaxJointMapBuildsPerFrame) {
 					continue;  // defer to next frame so we don't freeze for seconds
 				}
@@ -4230,7 +6171,7 @@ bool GraphManager::ShouldDeferHookInstall() const
 						SAF_LOG_WARN("[UPDATE] UpdateGraphs: actor not found for id={}, will retry", id);
 					}
 				} else {
-					SAF_LOG_INFO("[UPDATE] UpdateGraphs: building joint map for actor={} (1 per frame limit)", id);
+					SAF_LOG_INFO("[UPDATE] UpdateGraphs: building joint map for actor={}", id);
 					const bool ok = SafeBuildJointMap(actor, *state.skeleton, state.jointNodes);
 					jointMapsBuiltThisFrame++;
 					if (!ok) {
@@ -4252,13 +6193,18 @@ bool GraphManager::ShouldDeferHookInstall() const
 							state.cachedActor3DRoot = GetActor3DRootRaw(actor);
 							SAF_LOG_INFO("[UPDATE] UpdateGraphs: joint map built (found {}/{})", found, state.jointNodes.size());
 
-							// ── Capture rest pose: use animation bind (t=0) when available, else skeleton rest ──
+							// Pre-kompiluj flagi typów kości (zamiast per-klatkowych Is*() string porównań)
+							BuildJointTypeFlags(state);
+							SAF_LOG_INFO("[UPDATE] UpdateGraphs: joint type flags precomputed ({} joints)", state.jointTypeFlags.size());
+
+							// ── Capture rest pose: file bind pose from the ClipGenerator, else skeleton rest ──
+							// (never clip frame 0 — scene clips start in a scene pose; frame-0
+							// rest erases the absolute pose: hover above furniture, actors apart)
 							if (state.skeleton && state.skeleton->data) {
-								if (auto* clipGen = dynamic_cast<Animation::ClipGenerator*>(state.generator.get())) {
-									static thread_local std::vector<ozz::math::SoaTransform> s_restSoaBuf;
-									clipGen->SampleAtRatio(0.f, s_restSoaBuf);
-									UnpackSoaTransforms(std::span<const ozz::math::SoaTransform>(s_restSoaBuf.data(), s_restSoaBuf.size()),
-										state.restTransforms, state.skeleton->jointNames.size());
+								const auto* clipGen = dynamic_cast<Animation::ClipGenerator*>(state.generator.get());
+								if (clipGen && clipGen->HasBindPose() &&
+									clipGen->GetBindPose().size() == state.skeleton->jointNames.size()) {
+									UnpackBindPose(clipGen->GetBindPose(), state.restTransforms, state.skeleton->jointNames.size());
 								} else {
 									auto restSoa = state.skeleton->data->joint_rest_poses();
 									UnpackSoaTransforms(restSoa, state.restTransforms, state.skeleton->jointNames.size());
@@ -4278,14 +6224,25 @@ bool GraphManager::ShouldDeferHookInstall() const
 							}
 
 							const std::uintptr_t off = g_niTransformOffset.load(std::memory_order_acquire);
+							// Przechwytuj OBIE: rotacje I translacje – identycznie jak LoadAndStartAnimation.
+							// Brak translacji powodował że kości twarzy (faceBone_*) nie wracały
+							// do stanu sprzed animacji gdy animacja była uruchamiana po raz drugi przez Papyrus.
 							state.gameBaseRotations.resize(state.jointNodes.size());
+							state.gameBaseTranslations.resize(state.jointNodes.size());
 							for (size_t si = 0; si < state.jointNodes.size(); ++si) {
 								auto& arr = state.gameBaseRotations[si];
 								if (!state.jointNodes[si] || !ReadBoneRotation(state.jointNodes[si], off, arr.data())) {
 									arr = {1,0,0, 0,1,0, 0,0,1};
 								}
+								auto& t = state.gameBaseTranslations[si];
+								Animation::Transform gamePose;
+								if (state.jointNodes[si] && ReadBoneFullTransform(state.jointNodes[si], off, gamePose)) {
+									t = { gamePose.translation.x, gamePose.translation.y, gamePose.translation.z };
+								} else {
+									t = { 0.0f, 0.0f, 0.0f };
+								}
 							}
-							SAF_LOG_INFO("[UPDATE] UpdateGraphs: game base rotations captured ({} joints)", state.gameBaseRotations.size());
+							SAF_LOG_INFO("[UPDATE] UpdateGraphs: game base rotations+translations captured ({} joints)", state.gameBaseRotations.size());
 
 							// Optional: capture actor rest pose (rotation + translation) from each bone for UseActorRestPose.
 							if (g_useActorRestPose.load(std::memory_order_acquire)) {
@@ -4335,15 +6292,7 @@ bool GraphManager::ShouldDeferHookInstall() const
 								for (const char** d = kDumpBones; *d; ++d) {
 									if (jname == *d) { dump = true; break; }
 								}
-								if (!dump) continue;
-								const float* b = state.gameBaseRotations[si].data();
-								SAF_LOG_INFO("[BONEMAT] joint='{}' idx={} game_base_row0=[{:.4f},{:.4f},{:.4f}] row1=[{:.4f},{:.4f},{:.4f}] row2=[{:.4f},{:.4f},{:.4f}]",
-									jname, si, b[0],b[1],b[2], b[3],b[4],b[5], b[6],b[7],b[8]);
-								if (si < state.restTransforms.size()) {
-									const auto& r = state.restTransforms[si];
-									SAF_LOG_INFO("[BONEMAT] joint='{}' ozz_rest_q=[{:.4f},{:.4f},{:.4f},{:.4f}]",
-										jname, r.rotation.x, r.rotation.y, r.rotation.z, r.rotation.w);
-								}
+							if (!dump) continue;
 							}
 						}
 					}
@@ -4376,6 +6325,43 @@ bool GraphManager::ShouldDeferHookInstall() const
 				continue;  // ← PRZED Generate() – unika crash na śmieciowym szkielecie
 			}
 
+			// ── Compose stamp: rozwiąż modelNode aktora ───────────────────────────────
+			// OSF-style: te same macierze co w node->local trafiają też bezpośrednio do
+			// bufora rig (compose silnika czyta go tuż przed złożeniem świata) — dzięki
+			// temu animacja działa w zwykłej rozgrywce, a nie tylko w trybie foto.
+			// Bind próbujemy raz na 3D root + ograniczona liczba ponowień, gdy 3D/model
+			// jeszcze się ładuje (po 600 nieudanych próbach czekamy na zmianę 3D root).
+			if (g_composeStampPose.load(std::memory_order_acquire) && actorRoot) {
+				const bool rootChanged = (state.stampFadeNode != actorRoot);
+				const bool unbound = (state.stampModelNode == nullptr);
+				if (rootChanged || (unbound && state.stampBindFailCount < 600)) {
+					if (rootChanged) {
+						state.stampFadeNode = actorRoot;
+						state.stampBindFailCount = 0;
+						// Stara migawka w slocie wskazuje na martwy modelNode — zwolnij,
+						// zanim rebindowanie opublikuje nową tożsamość.
+						ReleaseStampSlot(state);
+					}
+					bool bound = false;
+					if (IsBSFadeNodeRaw(actorRoot)) {
+						if (auto* modelNode = GetModelNodeFromFadeNodeRaw(actorRoot)) {
+							bound = BuildStampBinding(state, modelNode);
+						}
+					}
+					if (bound) {
+						SAF_LOG_INFO("[COMPOSE] bound actor {:X}: {} bones (nodes={}, rigBones={})",
+							id, state.stampBinding.size(), state.stampNodeCount, state.stampRigBoneCount);
+					} else {
+						++state.stampBindFailCount;
+						ReleaseStampSlot(state);
+						static std::atomic<uint32_t> s_bindFail{ 0 };
+						if (s_bindFail++ < 5)
+							SAF_LOG_WARN("[COMPOSE] actor {:X}: bind attempt failed (retry #{}; fadeNode={:p})",
+								id, state.stampBindFailCount, static_cast<void*>(actorRoot));
+					}
+				}
+			}
+
 			// Sanity check: skeleton musi mieć rozumną liczbę kości.
 			// Crash z logów: jointCount=54092774585 (śmieć) → UnpackSoaTransforms alokuje
 			// ogromny wektor → AV w std::string przy iteracji po jointNames[i].
@@ -4391,10 +6377,14 @@ bool GraphManager::ShouldDeferHookInstall() const
 			++state.animFrameCount;
 
 			if (clipGen && clipGen->IsFinished()) {
-				state.positionLocked = false;
 				auto itSeq = g_actorSequenceState.find(id);
 				if (itSeq != g_actorSequenceState.end()) {
 					if (actor) sequenceAdvanceActors.push_back(actor);
+				} else {
+					state.positionLocked = false;
+					// Auto-stop: usuń aktora z grafu po zakończeniu animacji
+					// (bez sekwencji nie ma kto wywołać DetachGenerator).
+					if (actor) finishedAnimActors.push_back(actor);
 				}
 			}
 
@@ -4407,15 +6397,28 @@ bool GraphManager::ShouldDeferHookInstall() const
 			static Animation::Transform kIdentRest;  // default ctor: rot=(0,0,0,1)
 
 			size_t appliedCount = 0, skippedRoot = 0, skippedControlled = 0;
-			std::vector<RE::NiAVObject*> modifiedBones;
+			auto& modifiedBones = s_tlCache.modifiedBones;
 			modifiedBones.reserve(state.jointNodes.size());
+
+			// Compose stamp: nowa klatka – unieważnij poprzednie wpisy; pętla niżej oznaczy
+			// kości faktycznie zastosowane w tej klatce (reszta zostaje silnikowi).
+			const bool stampEnabled = g_composeStampPose.load(std::memory_order_acquire) && state.stampModelNode != nullptr;
+			if (stampEnabled) {
+				if (state.stampPose.size() != state.jointNodes.size())
+					state.stampPose.resize(state.jointNodes.size());
+				if (state.stampValid.size() != state.jointNodes.size())
+					state.stampValid.assign(state.jointNodes.size(), 0);
+				std::fill(state.stampValid.begin(), state.stampValid.end(), 0);
+			}
 
 			// ── Partial joint map refill ──────────────────────────────────────────────────
 			// Kości fizyczne (SOS/CBBE physics) mogą być załadowane przez silnik PO tym jak
-			// SAF zbudował joint map. Co 30 klatek sprawdzamy nullptr wpisy i uzupełniamy je
+			// SAF zbudował joint map. Co 120 klatek sprawdzamy nullptr wpisy i uzupełniamy je
 			// przez GetObjectByName – bez pełnego rebuildu (bez utraty gameBaseRotations).
 			// Gdy nowe kości zostaną znalezione, przechwytujemy ich gameBase w tym miejscu.
-			if (actor && actorRoot && state.animFrameCount > 0 && state.animFrameCount % 30 == 0) {
+			// Optymalizacja: po 3 skanach bez nowych kości przestajemy skanować.
+			if (actor && actorRoot && state.animFrameCount > 0 && state.animFrameCount % 120 == 0
+				&& state.refillEmptyScanCount < 3) {
 				const std::uintptr_t refillOff = g_niTransformOffset.load(std::memory_order_acquire);
 				size_t newlyFound = 0;
 				for (size_t si = 1; si < state.jointNodes.size(); ++si) {
@@ -4440,8 +6443,11 @@ bool GraphManager::ShouldDeferHookInstall() const
 					}
 				}
 				if (newlyFound > 0) {
+					state.refillEmptyScanCount = 0;
 					SAF_LOG_INFO("[UPDATE] Partial joint refill: found {} new bones (physics/SOS loaded late) for actor {:X}",
 						newlyFound, id);
+				} else {
+					++state.refillEmptyScanCount;
 				}
 			}
 			// ────────────────────────────────────────────────────────────────────────────────
@@ -4449,6 +6455,66 @@ bool GraphManager::ShouldDeferHookInstall() const
 			// Joint 0 is always the actor 3D root (or mapped to it). Never write to it or to any node that is the same as joint 0.
 			RE::NiAVObject* const skeletonRootNode = state.jointNodes.empty() ? nullptr : state.jointNodes[0];
 			ClearTorsoRefForFrame();
+
+			// ── [BONEREF] BoneWatch: diagnostyka drgań kości ───────────────────────────
+			// Co klatkę czyta local każdej obserwowanej kości (PRZED zapisem SAF, czyli
+			// wartość pozostawiona przez silnik po poprzedniej klatce) i liczy różnicę
+			// względem poprzedniej klatki (dq, stopnie). Duże/zmienne dq = kość drga.
+			// Log co BoneWatchInterval klatek: dq (bieżąca) + max_dq (maksimum w oknie).
+			// saf_writes=0 => SAF jej nie pisze. ch=1 => klip ma dla niej kanał.
+			if (!g_boneWatchJoints.empty()) {
+				static std::mutex s_watchMtx;
+				static std::unordered_map<const RE::NiAVObject*, std::array<float, 4>> s_prev;
+				static std::unordered_map<const RE::NiAVObject*, float> s_maxDq;
+				static uint32_t s_lastF = 0xFFFFFFFFu;
+				const uint32_t fcount = state.animFrameCount;
+				const int wInterval = g_boneWatchInterval.load(std::memory_order_acquire);
+				const std::uintptr_t woff = g_niTransformOffset.load(std::memory_order_acquire);
+				std::lock_guard<std::mutex> wl(s_watchMtx);
+				if (fcount < s_lastF) { s_prev.clear(); s_maxDq.clear(); }
+				s_lastF = fcount;
+				const bool doLog = (wInterval > 0) && (fcount >= static_cast<uint32_t>(wInterval)) &&
+					(fcount % static_cast<uint32_t>(wInterval)) == 0;
+				for (size_t i = 1; i < state.jointNodes.size(); ++i) {
+					RE::NiAVObject* node = state.jointNodes[i];
+					if (!node || !state.skeleton || i >= state.skeleton->jointNames.size()) continue;
+					const char* jn = state.skeleton->jointNames[i].c_str();
+					bool watched = false;
+					{
+						std::lock_guard<std::mutex> lk(g_boneWatchJointsMutex);
+						for (const auto& sub : g_boneWatchJoints)
+							if (ContainsSubCI(jn, sub)) { watched = true; break; }
+					}
+					if (!watched) continue;
+					float m[9];
+					if (woff == 0 || !ReadBoneRotation(node, woff, m)) continue;
+					float qx, qy, qz, qw;
+					Mat3ToQuat(m, qx, qy, qz, qw);
+					std::array<float, 4> q{ qx, qy, qz, qw };
+					float dq = -1.f;
+					auto it = s_prev.find(node);
+					if (it != s_prev.end()) {
+						float d = q[0] * it->second[0] + q[1] * it->second[1] + q[2] * it->second[2] + q[3] * it->second[3];
+						if (d < 0.f) d = -d;
+						if (d > 1.f) d = 1.f;
+						dq = 2.0f * std::acos(d) * 57.29578f;
+					}
+					s_prev[node] = q;
+					float& mx = s_maxDq[node];
+					if (dq > mx) mx = dq;
+					if (doLog) {
+						const uint32_t fl = (i < state.jointTypeFlags.size()) ? state.jointTypeFlags[i] : 0;
+						const int hasCh = (i < state.jointHasChannel.size()) ? state.jointHasChannel[i] : 0;
+						const bool safSkips = (fl & (ActorGraphState::kFlagPreserve | ActorGraphState::kFlagBelly | ActorGraphState::kFlagVaginaChain)) ||
+							((fl & ActorGraphState::kFlagFace) && !(fl & ActorGraphState::kFlagMouthRegion)) ||
+							((fl & ActorGraphState::kFlagPhysics) && !(fl & ActorGraphState::kFlagVaginaChain) && hasCh == 0);
+						SAF_LOG_INFO("[BONEREF] f={} '{}' dq={:.2f} max_dq={:.2f}deg saf_writes={} ch={} fl=0x{:X}",
+							fcount, jn, dq, mx, safSkips ? 0 : 1, hasCh, fl);
+						mx = 0.f;
+					}
+				}
+			}
+
 			for (size_t i = 0; i < state.jointNodes.size(); ++i) {
 				if (!state.jointNodes[i]) continue;
 				// Never apply to joint 0 (actor 3D root) – writing to it makes the character disappear.
@@ -4467,44 +6533,61 @@ bool GraphManager::ShouldDeferHookInstall() const
 					continue;
 				}
 
-				const char* jointName = (i < state.skeleton->jointNames.size()) ? state.skeleton->jointNames[i].c_str() : nullptr;
+				const char* jointName = nullptr;
+				if (state.skeleton && i < state.skeleton->jointNames.size()) {
+					try {
+						jointName = state.skeleton->jointNames[i].c_str();
+					} catch (...) {
+						// EBANEX lub inny mod modyfikuje skeleton - pomiń tę kość
+						SAF_LOG_WARN("UpdateGraphs: Invalid joint name at index {} for actor {:X}", i, id);
+						++skippedControlled;
+						continue;
+					}
+				}
+				// Używamy pre-kompilowanych flag bitowych (BuildJointTypeFlags) zamiast
+				// per-klatkowych IsFaceJoint/IsHandJoint/IsPhysicsJoint/etc. – 10+ string porównań.
+				const uint32_t jflags = (i < state.jointTypeFlags.size()) ? state.jointTypeFlags[i] : ActorGraphState::kFlagNone;
 				// Kości twarzy (Eye/Jaw/faceBone_*) – domyślnie zostawiamy silnikowi gry,
-				// z WYJĄTKIEM centralnych kości ust/szczęki:
-				//   faceBone_C_MouthPivot   – pivot żuchwy (otwieranie ust)
-				//   faceBone_C_LipsTop      – górna warga
-				//   faceBone_C_LipsBottom   – dolna warga
-				// Te trzy są animowane przez SAF (np. do prostych ruchów ust), reszta twarzy
-				// pozostaje pod pełną kontrolą FaceGen / morphów.
-				const bool isFace = jointName && IsFaceJoint(jointName);
-				const bool isLipsOrJawCenter =
-					jointName &&
-					(std::strcmp(jointName, "faceBone_C_LipsTop") == 0 ||
-					 std::strcmp(jointName, "faceBone_C_LipsBottom") == 0 ||
-					 std::strcmp(jointName, "faceBone_C_MouthPivot") == 0);
-				if (isFace && !isLipsOrJawCenter) {
+				// z WYJĄTKIEM zestawu faceBone wokół ust (kFlagMouthRegion) — SAF może je animować.
+				if ((jflags & ActorGraphState::kFlagFace) && !(jflags & ActorGraphState::kFlagMouthRegion)) {
 					++skippedControlled;
 					continue;
 				}
-				// Usta (MouthPivot/LipsTop/LipsBottom): jeśli klip nie ma kanału dla tej kości, nie animuj – zostaw grze (unikamy czarnego kwadratu).
-				if (isLipsOrJawCenter && i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
+				// Kości brzucha - zostaw pod kontrolą silnika gry
+				if (jflags & ActorGraphState::kFlagBelly) {
+					++skippedControlled;
+					continue;
+				}
+				// Wagina/labia/łechtaczka całkowicie pod kontrolą gry (bez implementacji w SAF).
+				if (jflags & ActorGraphState::kFlagVaginaChain) {
+					++skippedControlled;
+					continue;
+				}
+				// Usta / okolica ust: jeśli klip nie ma kanału dla tej kości, nie animuj – zostaw grze (unikamy czarnego kwadratu).
+				if ((jflags & ActorGraphState::kFlagMouthRegion) && i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
 					++skippedControlled;
 					continue;
 				}
 				// Dłonie: jeśli klip nie animuje tej kości (brak kanału), nie nadpisuj – zostaw grze (naturalna poza/IK).
-				if (jointName && IsHandJoint(jointName)) {
+				if ((jflags & ActorGraphState::kFlagHand) && i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
+					++skippedControlled;
+					continue;
+				}
+				// Kości fizyczne (INI), bez łańcucha waginy: bez kanału w klipie nie ruszaj — SOS/Havok.
+				if ((jflags & ActorGraphState::kFlagPhysics) && !(jflags & ActorGraphState::kFlagVaginaChain)) {
 					if (i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
 						++skippedControlled;
 						continue;
 					}
 				}
-				// TEMP: Wyłączono logikę kości piersi/włosów i fizyki do testów
-				/*
-				// Kości piersi i włosów: zostaw pod kontrolą gry aby uniknąć zniekształceń na meblach
-				if (jointName && IsBreastOrHairJoint(jointName)) {
+				// PreserveBones (włosy/piersi/jądra): SAF NIE pisze tych kości wcale —
+				// zostają w 100% pod kontrolą gry (animacja + jiggle/fizyka). Gdy SAF i
+				// silnik piszą ten sam local co klatkę, kość „walczy": drga/przyspiesza
+				// (szczególnie na meblach). Dotyczy też kości animowanych przez klip.
+				if (jflags & ActorGraphState::kFlagPreserve) {
 					++skippedControlled;
 					continue;
 				}
-				*/
 				// HumanRace.json ma zduplikowane nazwy (L_Wrist/R_Wrist dwa razy) – oba mapują na ten sam węzeł. Zapis tylko raz (pierwszy indeks wygrywa).
 				{
 					bool alreadyApplied = false;
@@ -4532,8 +6615,9 @@ bool GraphManager::ShouldDeferHookInstall() const
 
 				const float* base = (i < state.gameBaseRotations.size()) ? state.gameBaseRotations[i].data() : kIdentBase;
 
-				// ── FRAMEDUMP: first 6 frames + frames 30,60,90 for key bones ──────────────
-				if (jointName && (state.animFrameCount <= 6 || state.animFrameCount == 30 || state.animFrameCount == 60 || state.animFrameCount == 90)) {
+				// ── FRAMEDUMP (wyłączone domyślnie — UpdateGraphsVerboseFrameDump=1 w INI) ───
+				if (g_updateGraphsVerboseFrameDump.load(std::memory_order_acquire) &&
+				    jointName && (state.animFrameCount <= 6 || state.animFrameCount == 30 || state.animFrameCount == 60 || state.animFrameCount == 90)) {
 					static const char* kFrameDumpBones[] = {
 						"R_Biceps","R_Thigh","R_Calf","C_Spine","C_Pelvis","Pelvis","Hips",
 						"L_Thigh","L_Calf",nullptr
@@ -4551,9 +6635,21 @@ bool GraphManager::ShouldDeferHookInstall() const
 					}
 				}
 
-				ApplyTransform(state.jointNodes[i], anim, rest, base, jointName);
+				ApplyTransform(state.jointNodes[i], anim, rest, base, jointName, state.clipNeedsYUpToZUp);
 				modifiedBones.push_back(state.jointNodes[i]);
 				++appliedCount;
+				// Compose stamp: read-back dokładnie tych 16 floatów, które przed chwilą trafiły
+				// do node->local (ten sam wątek). Hook compose wrzuci je do bufora rig.
+				if (stampEnabled && CaptureStampSlotRaw(state, i)) {
+					state.stampValid[i] = 1;
+				}
+			}
+
+			// Publikuj migawkę pozy do lock-free slotu: compose (wątki równoległe silnika)
+			// czyta ją bez g_graphMutex — try_lock przegrywał z pętlą apply pompy i stamp
+			// był pomijany w większości klatek (przeskoki do pozy sprzed animacji).
+			if (stampEnabled && state.stampModelNode) {
+				PublishStampSnapshot(state);
 			}
 
 			if (ucount <= 5 || ucount % 120 == 0) {
@@ -4565,78 +6661,248 @@ bool GraphManager::ShouldDeferHookInstall() const
 				// Blokadę pozycji stosujemy tylko podczas odtwarzania; po zakończeniu animacji (IsFinished)
 				// nie blokujemy ruchu – gracz/NPC może znowu chodzić (WASD / AI).
 				const bool clipFinished = clipGen && !clipGen->IsLooping() && clipGen->IsFinished();
-				if (state.positionLocked && !clipFinished) {
-					// „Twarde kotwienie” pozycji i obrotu (tylko gdy LockActorForAnimation / SetGraphControlsPosition).
-					RE::NiPoint3 pos(state.positionX, state.positionY, state.positionZ);
-					actor->SetPosition(pos, false);
-					actor->data.angle.x = state.angleX;
-					actor->data.angle.y = state.angleY;
-					actor->data.angle.z = state.angleZ;
-				} else if (!clipFinished) {
-					// Sync slave: wyrównaj pozycję i rotację do ownera (prosto, bez cache).
-					auto itSync = g_syncOwner.find(id);
-					if (itSync != g_syncOwner.end() && itSync->second != id) {
-						RE::Actor* owner = RE::TESForm::LookupByID<RE::Actor>(itSync->second);
-						if (owner) {
-							RE::NiPoint3 opos = owner->GetPosition();
-							RE::NiPoint3 oang = owner->GetAngle();
-
-							// Pozycja: SetPosition (przez silnik) + data.location (wewnętrzny struct).
-							actor->SetPosition(opos, false);
-							actor->data.location = opos;
-
-							// Kąt: data.angle to wewnętrzny struct; silnik użyje go przy następnym
-							// własnym ticku żeby ustawić NiNode – ale my nie możemy czekać. Ustawiamy
-							// data.angle ORAZ bezpośrednio macierz rotacji root node (tak samo jak
-							// silnik robi to na podstawie data.angle). Dzięki temu slave ma właściwy
-							// kierunek już w tej samej klatce co owner.
-							actor->data.angle.x = oang.x;
-							actor->data.angle.y = oang.y;
-							actor->data.angle.z = oang.z;
-
-							// Kopiuj macierz rotacji ownera na root node slave'a.
-							// world.rotate = aktualna orientacja w świecie po SafeUpdateWorldData ownera.
-							// Używamy world.rotate zamiast local (przez offset) – pewniejsze dla BSFadeNode.
-							RE::NiAVObject* ownerRoot = GetActor3DRootRaw(owner);
-							if (ownerRoot && actorRoot) {
-								float rot9[9];
-								if (ReadWorldRotation(ownerRoot, rot9)) {
-									const std::uintptr_t rotOff = g_niTransformOffset.load(std::memory_order_acquire);
-									if (rotOff != 0)
-										RestoreBoneRotationRaw(actorRoot, rotOff, rot9);
-								}
+				// ── Pin pozycji: wszystko zablokowane jak wcześniej ──────────
+				// Wizual (root renderu) + data.location/angle + yaw + AI.
+				// KAPSUŁY NIE RUSZAMY W OGÓLE (żadnego SetPosition w pompie
+				// ani przy starcie): jej teleporty powodowały gumkowanie
+				// i przeskoki. Kapsułą zarządza wyłącznie silnik/Ebanex.
+				//   - positionLocked → własna kotwica,
+				//   - sync owner     → własna kotwica z attachu,
+				//   - sync slave     → kotwica ownera (stała),
+				//   - solo           → brak pinu.
+				bool doPin = false;
+				float pinX = 0.f, pinY = 0.f, pinZ = 0.f;
+				float pinAX = 0.f, pinAY = 0.f, pinAZ = 0.f;
+				if (!clipFinished) {
+					if (state.positionLocked) {
+						doPin = true;
+						pinX = state.positionX; pinY = state.positionY; pinZ = state.positionZ;
+						pinAX = state.angleX; pinAY = state.angleY; pinAZ = state.angleZ;
+					} else {
+						auto itSync = g_syncOwner.find(id);
+						if (itSync != g_syncOwner.end()) {
+							if (itSync->second == id) {
+								doPin = true;
+								pinX = state.positionX; pinY = state.positionY; pinZ = state.positionZ;
+								pinAX = state.angleX; pinAY = state.angleY; pinAZ = state.angleZ;
+							} else if (auto ito = g_actorGraphs.find(itSync->second); ito != g_actorGraphs.end()) {
+								doPin = true;
+								pinX = ito->second.positionX; pinY = ito->second.positionY; pinZ = ito->second.positionZ;
+								pinAX = ito->second.angleX; pinAY = ito->second.angleY; pinAZ = ito->second.angleZ;
+							} else if (RE::Actor* liveOwner = RE::TESForm::LookupByID<RE::Actor>(itSync->second)) {
+								doPin = true;
+								RE::NiPoint3 op = liveOwner->GetPosition();
+								RE::NiPoint3 oa = liveOwner->GetAngle();
+								pinX = op.x; pinY = op.y; pinZ = op.z;
+								pinAX = oa.x; pinAY = oa.y; pinAZ = oa.z;
 							}
 						}
 					}
 				}
-				// Wymuś orientację aktora co klatkę po zastosowaniu kości.
-				// Dla sync slave'a: najpierw synchronizuj state.angleZ ze stanem ownera,
-				// żeby yawMat slave'a był identyczny z yawMat ownera.
-				// Dla ownera i niezsyncrowanych: użyj własnego state.angleZ.
-				if (actor && actorRoot) {
-					const std::uintptr_t rotOff2 = g_niTransformOffset.load(std::memory_order_acquire);
-					if (rotOff2 != 0) {
-						float yaw = state.angleZ;
-						// Sync slave: pobierz angleZ z grafu ownera (ten sam kąt gwarantuje
-						// identyczny yawMat dla obu aktorów niezależnie od stanu NPC AI).
-						const auto itSyncChk = g_syncOwner.find(id);
-						if (itSyncChk != g_syncOwner.end() && itSyncChk->second != id) {
-							const auto itOwnerState = g_actorGraphs.find(itSyncChk->second);
-							if (itOwnerState != g_actorGraphs.end())
-								yaw = itOwnerState->second.angleZ;
+				// Tryb OSF stosujemy tylko NPC. Gracz (0x14) jest sync ownerem i przy
+				// mode 1 jego kapsuła nie jest trzymana na kotwicy — GetPosition dryfował,
+				// a kolejny attach robił snap z powrotem („ucieka z animacji"). Gracz
+				// zostaje w trybie 0; NPC dostaje tryb 1, bo to właśnie per-frame zapis
+				// data.location/angle kazał silnikowi dobierać podkroki Havok na meblu
+				// (przyspieszony jiggle: piersi/włosy/jądra).
+				const bool anchorMode = g_anchorCapsuleMode.load(std::memory_order_acquire) && id != 0x14;
+				// Tryb OSF: pinujemy ZAWSZE (także gdy positionLocked=false i brak grupy
+				// sync, np. scena Ebanex używająca SyncGraphs) do kotwicy przechwyconej
+				// przy ataczu. Bez tego aktor jechał z root motion klipu → uciekał z mebla.
+				if (anchorMode && !doPin && !clipFinished) {
+					doPin = true;
+					pinX = state.positionX; pinY = state.positionY; pinZ = state.positionZ;
+					pinAX = state.angleX; pinAY = state.angleY; pinAZ = state.angleZ;
+				}
+				if (doPin) {
+					// Per-plikowa korekta roota (RootOffsets.ini): akty wypieczone
+					// na inną wysokość niż kotwica sceny.
+					pinX += state.rootOffsetX;
+					pinY += state.rootOffsetY;
+					pinZ += state.rootOffsetZ;
+					if (anchorMode) {
+						// ── Tryb OSF (poprawiony) ──
+						// NIE ruszamy kapsuły przez SetPosition(kotwica) — używa
+						// referencji „stóp"/kapsuły, a kotwica jest w układzie węzła
+						// root → aktor lądował NAD meblem.
+						// NIE nadpisujemy data.location/angle co klatkę — to kazało
+						// silnikowi dodawać podkroki fizyki (grawitacja kumulowana:
+						// włosy/jądra/piersi „ciągnięte do podłogi", przyspieszone).
+						// Pinujemy WYŁĄCZNIE wizualny root do kotwicy. Kotwica dla
+						// kolejnych animacji jest przenoszona przy ataczu (nie z
+						// GetPosition, żeby dryf kapsuły jej nie psuł).
+						if (actorRoot) {
+							const std::uintptr_t pinOff = g_niTransformOffset.load(std::memory_order_acquire);
+							if (pinOff != 0) {
+								const float anchorT[3] = { pinX, pinY, pinZ };
+								PinRootTranslationHard(actorRoot, pinOff, anchorT);
+							}
 						}
-						const float c = std::cos(yaw), s = std::sin(yaw);
-						const float yawMat[9] = { c,-s,0.f, s,c,0.f, 0.f,0.f,1.f };
-						RestoreBoneRotationRaw(actorRoot, rotOff2, yawMat);
+						// Zapamiętaj kotwicę RAZ na klip (fallback, gdy mod nie woła
+						// SetActorPosition): kolejne animacje tej samej sceny użyją tego
+						// samego pinu. Co klatkę nie ma sensu — zapis nadpisywałby cache
+						// z AttachGenerator (pending lock) i logował INFO 60×/s.
+						// Nie degradować istniejącej kotwicy autorytatywnej.
+						if (!state.capsuleSeated) {
+							auto& cache = g_anchorCache[id];
+							cache.x = pinX; cache.y = pinY; cache.z = pinZ;
+							cache.ax = pinAX; cache.ay = pinAY; cache.az = pinAZ;
+							cache.valid = true;
+							SAF_LOG_INFO("AnchorCapsuleMode: cached anchor for {:X} ({:.1f},{:.1f},{:.1f})", id, pinX, pinY, pinZ);
+						}
+						// Seat the Havok capsule on the anchor once (and again when
+						// the anchor moves). Without this the capsule stays where
+						// the actor stood before SetActorPosition; the engine later
+						// pulls the visual root back to it -> actors drift apart
+						// (randomly, depending on AI/streaming timing at scene start).
+						const float seatDx = pinX - state.capsuleSeatX;
+						const float seatDy = pinY - state.capsuleSeatY;
+						const float seatDz = pinZ - state.capsuleSeatZ;
+						const bool anchorMoved = (seatDx*seatDx + seatDy*seatDy + seatDz*seatDz) > 0.01f;
+						if (actor && (!state.capsuleSeated || anchorMoved)) {
+							capsuleSeatRequests.emplace_back(actor, RE::NiPoint3{ pinX, pinY, pinZ });
+							state.capsuleSeated = true;
+							state.capsuleSeatX = pinX;
+							state.capsuleSeatY = pinY;
+							state.capsuleSeatZ = pinZ;
+						}
+					} else {
+						// ── Stary tryb SAF: pin wizualnego roota + data.location/angle ──
+						if (actorRoot) {
+							const std::uintptr_t pinOff = g_niTransformOffset.load(std::memory_order_acquire);
+							if (pinOff != 0) {
+								const float anchorT[3] = { pinX, pinY, pinZ };
+								RestoreBoneTranslationRaw(actorRoot, pinOff, anchorT);
+							}
+						}
+						actor->data.location.x = pinX;
+						actor->data.location.y = pinY;
+						actor->data.location.z = pinZ;
+						actor->data.angle.x = pinAX;
+						actor->data.angle.y = pinAY;
+						actor->data.angle.z = pinAZ;
+						// UWAGA: brak SetPosition — kapsuły nie ruszamy.
 					}
 				}
+				// Wymuś orientację aktora co klatkę po zastosowaniu kości.
+				// Yaw enforcement działa TYLKO dla aktorów przypiętych:
+				//   - positionLocked (kotwienie pozycji – aktor ma zablokowany kąt)
+				//   - sync slave i sync owner (scena wieloosobowa – wspólny kierunek)
+				// Dla niezablokowanych, niesynchronizowanych aktorów wymuszanie yaw
+				// walczy z silnikiem gry (który ustawia data.angle według AI), powodując
+				// trzęsienie („shaking") i chodzenie do tyłu.
+				// Wymuszamy też w trybie OSF (anchorMode): tryb 1 pinuje samą
+				// translację roota, a rotację roota zostawia silnikowi. Wtedy para
+				// sceny może mieć ROŻNE orientacje rootów mimo identycznego pinu
+				// pozycji → ciała rozjeżdżają się obrotowo (losowo, zależnie od
+				// tego, jaki heading miały przy ataczu). Obrót roota nie wpływa
+				// na kapsułę Havok, więc nie wraca problem podkroków fizyki.
+				if (actor && actorRoot && !clipFinished && state.generator) {
+					const bool isSyncSlave = [&]() -> bool {
+						auto it = g_syncOwner.find(id);
+						return it != g_syncOwner.end() && it->second != id;
+					}();
+					const bool isSyncOwner = [&]() -> bool {
+						auto it = g_syncOwner.find(id);
+						return it != g_syncOwner.end() && it->second == id;
+					}();
+					if (state.positionLocked || isSyncSlave || isSyncOwner) {
+						const std::uintptr_t rotOff2 = g_niTransformOffset.load(std::memory_order_acquire);
+						if (rotOff2 != 0) {
+							float yaw = state.angleZ;
+							if (isSyncSlave) {
+								const auto itOwnerState = g_actorGraphs.find(g_syncOwner[id]);
+								if (itOwnerState != g_actorGraphs.end())
+									yaw = itOwnerState->second.angleZ;
+							}
+							const float c = std::cos(yaw), s = std::sin(yaw);
+							const float yawMat[9] = { c,-s,0.f, s,c,0.f, 0.f,0.f,1.f };
+							RestoreBoneRotationRaw(actorRoot, rotOff2, yawMat);
+						}
+					}
+				}
+				// Okresowe dobijanie blokady AI (styl OSF: co ~18 klatek).
+				// Silnik potrafi wyczyścić flagi przy ewaluacji pakietów —
+				// wtedy NPC odzyskuje kontrolę w środku sceny (wstaje, odwraca
+				// się do innego aktora, odchodzi od mebla). Dotyczy tylko NPC;
+				// gracza (0x14) nigdy nie blokujemy.
+				if (!clipFinished && id != 0x14 && (state.animFrameCount % 18) == 0) {
+					actor->boolBits.set(RE::Actor::BOOL_BITS::kHeadingFixed);
+					actor->boolFlags.set(RE::Actor::BOOL_FLAGS::kMovementBlocked);
+					actor->boolFlags2.set(RE::Actor::BOOL_FLAGS2::kAnimationDriven);
+				}
 				SafeUpdateWorldData(actor, actorRoot, &modifiedBones);
+
+				// ── Weryfikacja pinu: root MUSI być na kotwicy ──────────────────
+				// Jeśli równoległy pass silnika przeliczył world ze starego locala
+				// (albo nasz zapis locala przepadł), renderowany root zostaje na
+				// pozycji sprzed SetActorPosition → para aktorów się rozjeżdża przy
+				// starcie sceny (losowo, zależnie od timingu AI/streamingu).
+				// Wymuszamy world + logujemy, żeby kolejny log pokazał, czy to wystąpiło.
+				if (doPin && actorRoot) {
+					const float localX = actorRoot->local.translate.x;
+					const float localY = actorRoot->local.translate.y;
+					const float localZ = actorRoot->local.translate.z;
+					const RE::NiPoint3 wNow = actorRoot->world.translate;
+					const float ddx = wNow.x - pinX;
+					const float ddy = wNow.y - pinY;
+					const float ddz = wNow.z - pinZ;
+					if (ddx*ddx + ddy*ddy + ddz*ddz > 0.0025f) {
+						const std::uintptr_t fixOff = g_niTransformOffset.load(std::memory_order_acquire);
+						const float fixT[3] = { pinX, pinY, pinZ };
+						PinRootTranslationHard(actorRoot, fixOff, fixT);
+						static std::atomic<uint32_t> s_pinFixLogs{ 0 };
+						if (s_pinFixLogs.fetch_add(1) < 40) {
+							SAF_LOG_WARN("[PIN] {:X} root off anchor by {:.2f}m -> forced world. pin=({:.2f},{:.2f},{:.2f}) world=({:.2f},{:.2f},{:.2f}) local=({:.2f},{:.2f},{:.2f}) loc=({:.2f},{:.2f},{:.2f}) root={:p} cached={:p} off=0x{:X} jointMap={} frame={}",
+								id, std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz),
+								pinX, pinY, pinZ,
+								wNow.x, wNow.y, wNow.z,
+								localX, localY, localZ,
+								actor->data.location.x, actor->data.location.y, actor->data.location.z,
+								static_cast<void*>(actorRoot), static_cast<void*>(state.cachedActor3DRoot),
+								fixOff, state.jointMapBuilt ? 1 : 0, state.animFrameCount);
+						}
+					}
+				}
+
+				// [PIN] Jedna linia na klip: cel pinu, faktyczny root (po pinie),
+				// kapsuła i kąty. Pozwala odróżnić „aktor stoi na kotwicy" od
+				// „silnik przesunął root o pół metra" oraz sprawdzić, czy oba
+				// aktory pary mają ten sam pin i ten sam yaw roota.
+				if (doPin && !state.pinDiagLogged) {
+					state.pinDiagLogged = true;
+					const float rX = actorRoot ? actorRoot->world.translate.x : 0.f;
+					const float rY = actorRoot ? actorRoot->world.translate.y : 0.f;
+					const float rZ = actorRoot ? actorRoot->world.translate.z : 0.f;
+					const float rYaw = actorRoot
+						? std::atan2(actorRoot->world.rotate.entry[1][0], actorRoot->world.rotate.entry[0][0])
+						: 0.f;
+					RE::TESFormID ownerId = 0;
+					float oX = 0.f, oY = 0.f, oZ = 0.f, oYaw = 0.f;
+					if (auto itS = g_syncOwner.find(id); itS != g_syncOwner.end()) {
+						ownerId = itS->second;
+						if (auto ito = g_actorGraphs.find(ownerId); ito != g_actorGraphs.end()) {
+							oX = ito->second.positionX; oY = ito->second.positionY; oZ = ito->second.positionZ;
+							oYaw = ito->second.angleZ;
+						}
+					}
+					SAF_LOG_INFO("[PIN] {:X} mode={} lock={} pin=({:.2f},{:.2f},{:.2f}) yaw={:.3f} root=({:.2f},{:.2f},{:.2f}) rootYaw={:.3f} loc=({:.2f},{:.2f},{:.2f}) owner={:X} ownerPin=({:.2f},{:.2f},{:.2f}) ownerYaw={:.3f}",
+						id, anchorMode ? 1 : 0, state.positionLocked ? 1 : 0,
+						pinX, pinY, pinZ, state.angleZ,
+						rX, rY, rZ, rYaw,
+						actor->data.location.x, actor->data.location.y, actor->data.location.z,
+						ownerId, oX, oY, oZ, oYaw);
+				}
 
 				// Synchronizuj data.location aktora z aktualną pozycją NiNode root (world.translate).
 				// Naśladuje mechanizm NAF: Graph::Update() -> PushAnimationOutput -> rootTransform
 				// -> silnik gry synchronizuje kapsułę havok z data.location przy następnym AI ticku.
 				// BEZ Actor::SetPosition() – nie zakłóca animacji ani fizyki.
 				// actorRoot jest już zwalidowany przez SafeUpdateWorldData powyżej – AV niemożliwe.
+				// Tryb OSF (anchorMode): root pinujemy do kotwicy, więc world.translate == kotwica;
+				// synchronizacja data.location = world.translate trzyma kapsułę na kotwicy BEZ
+				// rozjazdu. Dzięki temu kolejna animacja przechwytuje poprawną pozycję
+				// (GetPosition = data.location), a brak rozjazdu nie napędza fizyki jiggle.
 				if (actor && actorRoot) {
 					const RE::NiPoint3& worldPos = actorRoot->world.translate;
 					const RE::NiPoint3& curLoc   = actor->data.location;
@@ -4650,7 +6916,87 @@ bool GraphManager::ShouldDeferHookInstall() const
 			}
 			}
 		}
+		// Apply one-time capsule seats now that g_graphMutex is released.
+		for (auto& [seatActor, seatPos] : capsuleSeatRequests) {
+			if (!seatActor) continue;
+			seatActor->data.location = seatPos;
+			seatActor->SetPosition(seatPos, true);
+			// SetPosition przesuwa kapsułę; renderowany root potrafi zostać na
+			// pozycji sprzed kotwicy do następnego passu silnika. Pinujemy go
+			// od razu, żeby pierwsza klatka sceny była już poprawna.
+			float rootX = 0.f, rootY = 0.f, rootZ = 0.f;
+			bool haveRoot = false;
+			if (RE::NiAVObject* seatRoot = GetActor3DRootRaw(seatActor)) {
+				const std::uintptr_t seatOff = g_niTransformOffset.load(std::memory_order_acquire);
+				const float seatT[3] = { seatPos.x, seatPos.y, seatPos.z };
+				PinRootTranslationHard(seatRoot, seatOff, seatT);
+				rootX = seatRoot->world.translate.x;
+				rootY = seatRoot->world.translate.y;
+				rootZ = seatRoot->world.translate.z;
+				haveRoot = true;
+			}
+			if (haveRoot) {
+				SAF_LOG_INFO("AnchorCapsuleMode: capsule seated for {:X} at ({:.2f},{:.2f},{:.2f}) root=({:.2f},{:.2f},{:.2f})",
+					seatActor->GetFormID(), seatPos.x, seatPos.y, seatPos.z, rootX, rootY, rootZ);
+			} else {
+				SAF_LOG_INFO("AnchorCapsuleMode: capsule seated for {:X} at ({:.2f},{:.2f},{:.2f}) (no 3D root yet)",
+					seatActor->GetFormID(), seatPos.x, seatPos.y, seatPos.z);
+			}
+		}
 		for (RE::Actor* a : sequenceAdvanceActors) AdvanceSequence(a, false);
+		// Auto-stop: aktorzy z zakończoną animacją (bez sekwencji) są usuwani z grafu.
+		for (RE::Actor* a : finishedAnimActors) {
+			StopAnimation(a);
+		}
+	}
+
+	// Wywoływane z hooka BGSModelNode::Update (slot 2) na wątkach gry, TUŻ przed tym jak
+	// silnik złoży i zatwierdzi szkielet (compose+commit). Wpisuje ostatnią pozę SAF do
+	// bufora rig->local->data — deterministyczny punkt zapisu (mechanizm z osf-animation).
+	// Lock-free: czyta migawki opublikowane przez pompę do g_stampSlots. Wcześniej brał
+	// try_lock(g_graphMutex) — compose biega na wątkach RÓWNOLEGŁYCH silnika, a pompa trzyma
+	// mutex przez całą pętlę apply, więc try_lock przegrywał w większości klatek → stamp
+	// pomijany → silnik nadpisywał pozę (przeskoki do pozy sprzed animacji).
+	void GraphManager::StampCompose(RE::BGSModelNode* a_modelNode)
+	{
+		if (!a_modelNode || !g_composeStampPose.load(std::memory_order_acquire)) return;
+
+		void* localData = nullptr;
+		std::uint32_t nodeCount = 0;
+		std::uint16_t rigBones = 0;
+		if (!ReadModelNodeRaw(a_modelNode, &localData, &nodeCount, &rigBones)) return;
+
+		for (auto& slot : g_stampSlots) {
+			std::shared_ptr<const StampSnapshot> snap = slot.load(std::memory_order_acquire);
+			if (!snap || snap->modelNode != a_modelNode) continue;
+
+			// Tożsamość migawki vs żywy węzeł: mutacja tabeli węzłów / bufora rig (patche
+			// hełmu przetasowują sloty) → pomiń; pompa zrobi rebind i opublikuje świeżą
+			// migawkę w następnej klatce.
+			if (snap->localData != localData || snap->nodeCount != nodeCount ||
+				snap->rigBoneCount != rigBones) {
+				return;
+			}
+			if (snap->pose.size() != snap->valid.size()) return;
+
+			std::uint32_t written = 0;
+			for (const auto& [jointIdx, rigIdx] : snap->binding) {
+				if (jointIdx >= snap->valid.size()) continue;
+				if (!snap->valid[jointIdx]) continue;
+				if (rigIdx >= rigBones) continue;
+				if (WriteStampSlotRaw(localData, rigIdx, snap->pose[jointIdx].data())) {
+					++written;
+				}
+			}
+
+			static std::atomic<std::uint32_t> s_composeStamps{ 0 };
+			const auto n = ++s_composeStamps;
+			if (n <= 3 || n % 1800 == 0) {
+				SAF_LOG_INFO("[COMPOSE] stamped: {}/{} bones (rigBones={})",
+					written, snap->binding.size(), rigBones);
+			}
+			return;  // jeden modelNode → najwyżej jedna migawka
+		}
 	}
 
 	bool GraphManager::HasActiveGraphs() const
@@ -4659,9 +7005,152 @@ bool GraphManager::ShouldDeferHookInstall() const
 		return !g_actorGraphs.empty();
 	}
 
-	void GraphManager::Reset()
+	bool GraphManager::IsActorPlaying(RE::Actor* a_actor) const
 	{
-		SAF_LOG_INFO("GraphManager::Reset - clearing animation data");
+		if (!a_actor) return false;
+		// Use try_lock to avoid deadlock when called from hooks during SAF update cycle
+		std::unique_lock<std::mutex> lock(g_graphMutex, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			// Failed to acquire lock - assume not playing to avoid deadlock
+			return false;
+		}
+		return g_actorGraphs.find(a_actor->GetFormID()) != g_actorGraphs.end();
+	}
+
+	void GraphManager::Reset(bool a_restoreBones)
+	{
+		SAF_LOG_INFO("GraphManager::Reset - clearing all session state for load/revert (restoreBones={})", a_restoreBones);
+
+		// Przywróć kości aktywnych aktorów przed wyczyszczeniem TYLKO gdy są jeszcze w pamięci.
+		// Przy kPreLoadGame (powrót z menu) gra już zwolniła te obiekty → pomijamy przywracanie
+		// aby uniknąć zapisu do zwolnionej pamięci (dangling pointer → crash na drugim wczytaniu).
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			if (a_restoreBones) {
+				const std::uintptr_t off = g_niTransformOffset.load(std::memory_order_acquire);
+				if (off != 0) {
+					for (auto& [id, state] : g_actorGraphs) {
+						if (state.gameBaseRotations.empty()) continue;
+						// Jak w DetachGenerator: przywracaj tylko stawy ruszane przez SAF,
+						// żeby nie nadpisać żywego stanu twarzy gry starym snapshotem.
+						RE::NiAVObject* skelRoot = state.jointNodes.empty() ? nullptr : state.jointNodes[0];
+						for (size_t i = 0; i < state.jointNodes.size() && i < state.gameBaseRotations.size(); ++i) {
+							if (!ShouldRestoreJointOnDetach(state, i, skelRoot, nullptr))
+								continue;
+							RE::NiAVObject* node = state.jointNodes[i];
+							if (!node) continue;
+							// RestoreBoneRotationRaw / TranslationRaw są __declspec(noinline) z własnym
+							// __try/__except — bezpieczne nawet gdy node jest dangling pointer.
+							RestoreBoneRotationRaw(node, off, state.gameBaseRotations[i].data());
+							if (i < state.gameBaseTranslations.size())
+								RestoreBoneTranslationRaw(node, off, state.gameBaseTranslations[i].data());
+						}
+					}
+				}
+			}
+			// Wyczyść wszystkie struktury stanu sesji
+			for (auto& entry : g_actorGraphs) {
+				ReleaseStampSlot(entry.second);
+			}
+			g_actorGraphs.clear();
+			g_actorSequenceState.clear();
+			g_syncOwner.clear();
+			g_syncOwnerRootCache.clear();
+			g_pendingAngleZ.clear();
+			g_pendingLockPosition.clear();
+			g_pendingFlagBackup.clear();
+			g_pendingAngleBackup.clear();
+			g_loggedAvActorsBuildJointMap.clear();
+			g_postAnimHeadingLock.clear();
+			g_anchorCache.clear();
+		}
+
+		// Zresetuj flagi per-klatkowe
+		g_rebindOnNextHook.store(false, std::memory_order_release);
+		g_forceUpdate.store(false, std::memory_order_release);
+		g_debugHookLogs.store(0, std::memory_order_release);
+		// Zachowaj g_mainThreadId — proces i główny wątek gry są te same po wczytaniu z menu.
+		// Zerowanie skłaniało się do niespójności ze stałym wątkiem taska SFTE i blokowało UpdateGraphs.
+		g_hookSeen.store(false, std::memory_order_release);
+
+		// NIE resetuj g_niTransformOffset/g_niTransformSearchDone –
+		// offset NiTransform jest stały dla danej wersji gry, nie zależy od sesji.
+		// NIE resetuj ustawień INI (g_useNAFApplyMode, g_physicsJoints itp.) –
+		// są wczytywane raz przy starcie pluginu.
+
+		SAF_LOG_INFO("GraphManager::Reset - done");
+	}
+
+	void GraphManager::FullReset()
+	{
+		SAF_LOG_INFO("GraphManager::FullReset - hard reset started");
+		// Najpierw pełne odczepienie aktywnych grafów (przywraca kości, flagi, pozycję).
+		StopAllAnimations();
+		// Następnie klasyczny reset wyczyści mapy sesji.
+		Reset(true);
+		// Wyczyść stan watchdoga, żeby stary alarm nie wpływał na nową sesję.
+		g_lastGraphUpdateNs.store(0, std::memory_order_release);
+		g_watchdogStallLogged.store(false, std::memory_order_release);
+		g_watchdogStallStartNs.store(0, std::memory_order_release);
+		// Wyczyść per-klatkowe cache.
+		g_torsoRefValid = false;
+		// Przywróć licznik pomijania pierwszych klatek hooka do wartości z konfiguracji.
+		g_skipFirstNHookCalls.store(g_skipFirstNHookCallsConfig.load(std::memory_order_acquire), std::memory_order_release);
+		// Odblokuj pompę, gdyby utknęła flaga save-load.
+		g_saveLoadInProgress.store(false, std::memory_order_release);
+		SAF_LOG_INFO("GraphManager::FullReset - done");
+	}
+
+	void GraphManager::Refresh()
+{
+		SAF_LOG_INFO("GraphManager::Refresh - restoring bones to game state (lighter than Reset)");
+
+		// Loguj zużycie pamięci przed Refresh
+		size_t totalMemory = 0;
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			for (const auto& [id, state] : g_actorGraphs) {
+				totalMemory += state.jointNodes.size() * sizeof(RE::NiAVObject*);
+				totalMemory += state.jointHasChannel.size() * sizeof(uint8_t);
+				totalMemory += state.localTransforms.size() * sizeof(Animation::Transform);
+				totalMemory += state.restTransforms.size() * sizeof(Animation::Transform);
+				totalMemory += state.actorRestTransforms.size() * sizeof(Animation::Transform);
+				totalMemory += state.gameBaseRotations.size() * sizeof(std::array<float,9>);
+				totalMemory += state.gameBaseTranslations.size() * sizeof(std::array<float,3>);
+			}
+		}
+		SAF_LOG_INFO("GraphManager::Refresh - memory usage: {:.2f} MB for {} actors", 
+			static_cast<double>(totalMemory) / (1024.0 * 1024.0), g_actorGraphs.size());
+
+		// Przywróć kości wszystkich aktywnych aktorów do stanu gry
+		// ale NIE czyść sesji - zachowaj animacje i stany
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			const std::uintptr_t off = g_niTransformOffset.load(std::memory_order_acquire);
+			if (off != 0) {
+				for (auto& [id, state] : g_actorGraphs) {
+					if (state.gameBaseRotations.empty()) continue;
+					// Jak w DetachGenerator: tylko stawy ruszane przez SAF (chroń twarz gry).
+					RE::NiAVObject* skelRoot = state.jointNodes.empty() ? nullptr : state.jointNodes[0];
+					for (size_t i = 0; i < state.jointNodes.size() && i < state.gameBaseRotations.size(); ++i) {
+						if (!ShouldRestoreJointOnDetach(state, i, skelRoot, nullptr))
+							continue;
+						RE::NiAVObject* node = state.jointNodes[i];
+						if (!node) continue;
+						RestoreBoneRotationRaw(node, off, state.gameBaseRotations[i].data());
+						if (i < state.gameBaseTranslations.size())
+							RestoreBoneTranslationRaw(node, off, state.gameBaseTranslations[i].data());
+					}
+				}
+			}
+		}
+
+		// Zresetuj tylko flagi per-klatkowe - zachowaj sesję
+		g_forceUpdate.store(false, std::memory_order_release);
+		g_debugHookLogs.store(0, std::memory_order_release);
+		g_hookSeen.store(false, std::memory_order_release);  // Odblokuj hooki po Refresh()
+
+		SAF_LOG_INFO("GraphManager::Refresh - done (session preserved, hooks unblocked)");
 	}
 
 	void GraphManager::CreateSaveData(SaveData& a_data)
@@ -4719,5 +7208,120 @@ bool GraphManager::ShouldDeferHookInstall() const
 				SyncGraphs(actors);
 		}
 		SAF_LOG_INFO("LoadSaveData: {} refs, {} sync groups", a_data.refs.size(), groups.size());
+	}
+
+	std::shared_ptr<SyncGroup> GraphManager::GetOrCreateSyncGroup(const std::vector<RE::TESFormID>& actorFormIds)
+	{
+		if (actorFormIds.empty()) return nullptr;
+
+		// Generate a stable sync group ID from the actor form IDs
+		std::uint64_t groupId = 0;
+		for (auto id : actorFormIds) {
+			groupId ^= id + 0x9e3779b97f4a7c15;  // hash combine
+		}
+		if (groupId == 0) groupId = 1;  // reserve 0 as invalid
+
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		
+		// Check if sync group already exists
+		auto it = _syncGroups.find(groupId);
+		if (it != _syncGroups.end()) {
+			// Update member mapping for any new actors
+			for (auto id : actorFormIds) {
+				_syncGroupMembers[groupId].insert(id);
+				_actorSyncGroupMap[id] = groupId;
+			}
+			return it->second;
+		}
+
+		// Create new sync group
+		auto syncGroup = std::make_shared<SyncGroup>();
+		_syncGroups[groupId] = syncGroup;
+		
+		// Register all actors in this sync group
+		std::unordered_set<RE::TESFormID> members;
+		for (auto id : actorFormIds) {
+			members.insert(id);
+			_actorSyncGroupMap[id] = groupId;
+		}
+		_syncGroupMembers[groupId] = std::move(members);
+		
+		SAF_LOG_INFO("Created sync group {} for {} actors", groupId, actorFormIds.size());
+		return syncGroup;
+	}
+
+	void GraphManager::RemoveActorFromSyncGroup(RE::TESFormID actorFormId)
+	{
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		
+		// Find which sync group this actor belongs to
+		auto it = _actorSyncGroupMap.find(actorFormId);
+		if (it == _actorSyncGroupMap.end()) return;  // Not in any sync group
+		
+		std::uint64_t groupId = it->second;
+		_actorSyncGroupMap.erase(it);
+		
+		// Remove actor from sync group members
+		auto membersIt = _syncGroupMembers.find(groupId);
+		if (membersIt != _syncGroupMembers.end()) {
+			membersIt->second.erase(actorFormId);
+			
+			// If sync group is now empty, clean it up
+			if (membersIt->second.empty()) {
+				_syncGroups.erase(groupId);
+				_syncGroupMembers.erase(membersIt);
+				SAF_LOG_INFO("Removed empty sync group {}", groupId);
+			}
+		}
+	}
+
+	bool GraphManager::IsActorGraphStranded(RE::TESFormID actorFormId, std::int64_t timeoutMs) const
+	{
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		auto it = g_actorGraphs.find(actorFormId);
+		if (it == g_actorGraphs.end()) return false;  // No graph = not stranded
+		
+		const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+		
+		const auto lastSample = it->second.lastSampleMs;
+		return (nowMs - lastSample) > timeoutMs;
+	}
+
+	void GraphManager::CleanupStrandedGraphs()
+	{
+		std::vector<RE::TESFormID> strandedActors;
+		const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+		
+		{
+			std::lock_guard<std::mutex> lock(g_graphMutex);
+			for (auto& [id, state] : g_actorGraphs) {
+				const auto lastSample = state.lastSampleMs;
+				// Use 5 second timeout for stranded detection
+				if ((nowMs - lastSample) > 5000) {
+					strandedActors.push_back(id);
+				}
+			}
+		}
+		
+		if (!strandedActors.empty()) {
+			SAF_LOG_WARN("Found {} stranded actor graphs, cleaning up", static_cast<std::size_t>(strandedActors.size()));
+			for (RE::TESFormID id : strandedActors) {
+				RE::Actor* actor = RE::TESForm::LookupByID<RE::Actor>(id);
+				if (actor) {
+					SAF_LOG_INFO("Cleaning up stranded graph for actor {:X}", static_cast<std::uint32_t>(id));
+					StopAnimation(actor);
+				} else {
+					// Actor no longer exists, clean up directly
+					std::lock_guard<std::mutex> lock(g_graphMutex);
+					if (auto it = g_actorGraphs.find(id); it != g_actorGraphs.end()) {
+						ReleaseStampSlot(it->second);
+					}
+					g_actorGraphs.erase(id);
+					RemoveActorFromSyncGroup(id);
+				}
+			}
+		}
 	}
 }

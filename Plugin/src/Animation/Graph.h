@@ -29,12 +29,10 @@ namespace Animation
 
         bool LoadGraph(RE::TESObjectREFR* a_ref) {
             if (!a_ref) return false;
-            SAF_LOG_DEBUG("Loading graph for form ID: {:X}", a_ref->GetFormID());
             return true;
         }
 
         void PlayEvent(const RE::BSFixedString& a_eventName) {
-            SAF_LOG_DEBUG("Sending graph event: {}", a_eventName.c_str());
         }
 
         float GetVariableFloat(const RE::BSFixedString& a_variableName) const { return 0.0f; }

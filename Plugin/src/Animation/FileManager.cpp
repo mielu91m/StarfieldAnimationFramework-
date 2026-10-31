@@ -10,7 +10,7 @@ namespace Animation
 	static bool FileIsBlendGraph(const FileID&) { return false; }
 
 	FileManager::FileManager()
-		: _workerThread([this]() { DoProcessRequests(); })
+		: _workerThread([this](std::stop_token st) { DoProcessRequests(st); })
 	{}
 
 	FileManager* FileManager::GetSingleton()
@@ -94,15 +94,29 @@ namespace Animation
 			a_animsOut.emplace_back(id, data.shared_handle);
 	}
 
+	void FileManager::ClearCache()
+	{
+		{
+			std::lock_guard lk(_reqMutex);
+			_requests.clear();
+		}
+		{
+			std::lock_guard lk(_loadedMutex);
+			_loadedAnimations.clear();
+		}
+		SAF_LOG_INFO("[FileManager] ClearCache: pending requests and loaded animation cache dropped");
+	}
+
 	void FileManager::ProcessRequests() { _workCV.notify_one(); }
 
-	void FileManager::DoProcessRequests()
+	void FileManager::DoProcessRequests(std::stop_token stopToken)
 	{
 		RequestData nextReq;
 		for (;;) {
 			{
 				std::unique_lock lk(_reqMutex);
-				_workCV.wait(lk, [this]() { return !_requests.empty(); });
+				_workCV.wait(lk, stopToken, [this]() { return !_requests.empty(); });
+				if (stopToken.stop_requested()) return;
 				nextReq = _requests.front();
 				_requests.pop_front();
 			}

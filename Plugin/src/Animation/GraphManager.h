@@ -4,7 +4,17 @@
 #include "Animation/Sequencer.h"
 #include "Animation/Graph.h"
 #include "Animation/Generator.h"  // ← DODANE: brakujący include
+#include "Animation/FrameClock.h"
 #include "Util/Event.h"
+
+#include <unordered_map>
+#include <unordered_set>
+#include <memory>
+
+namespace RE
+{
+	class BGSModelNode;
+}
 
 namespace Animation
 {
@@ -19,6 +29,15 @@ namespace Animation
 
 		// Instaluje GraphUpdateHook - musi być wywołane przy starcie
 		void InstallHooks();
+
+		/// Instaluje hook compose (BGSModelNode::Update, vtable slot 2) — OSF-style stamp
+		/// pozy SAF do bufora rig przed złożeniem świata przez silnik. Wywoływane z InstallHooks.
+		void InstallComposeHook();
+
+		/// Wywoływane z hooka compose dla każdego składanego szkieletu; jeśli szkielet należy
+		/// do animowanego aktora, wpisuje ostatnią pozę SAF do bufora rig (deterministyczny
+		/// punkt zapisu — działa też w zwykłej rozgrywce, nie tylko w trybie foto).
+		void StampCompose(RE::BGSModelNode* a_modelNode);
 
 		// Metody sterujące wywoływane przez konsolę
 		/// Returns true on success. On false, use GetLastLoadError() for a short message (e.g. for console).
@@ -74,20 +93,28 @@ namespace Animation
 		void UpdateGraphs(float a_deltaSeconds);
 		void RequestGraphUpdate();
 		bool HasActiveGraphs() const;
+		bool IsActorPlaying(RE::Actor* a_actor) const;
 		void EnableAnimationVtableHooks();
 		bool ShouldDeferHookInstall() const;
 		void SetMainThreadId(std::uint32_t a_threadId);
 		std::uint32_t GetMainThreadId() const;
 		bool IsMainThread() const;
+		void SetSaveLoadInProgress(bool a_inProgress);
+		bool IsSaveLoadInProgress() const;
+		/// SkipFirst przy revercie przez VM — nie mieszać z PostDataLoad (częste wołania blokowały animacje).
+		void ApplyRevertLoadSkipGuard();
 
-		Graph* GetGraphForActor(RE::TESObjectREFR* a_ref)
-		{
-			if (!a_ref) return nullptr;
-			// TODO: Implementacja mapy actor->graph
-			return &_internalGraph;
-		}
+		/// True gdy SAF jest już pompowany z hooka animacji lub z PermanentTask (bez dublowania z Input / SceneRect).
+		static bool IsPrimaryGraphPumpActive();
 
-		void Reset();
+		void Reset(bool a_restoreBones = true);
+		/// Hard reset: stops all animations, clears session state, resets watchdog/caches and unblocks
+		/// the update pump. Intended for the 'saf rebind' console command when actors are frozen/shaking.
+		void FullReset();
+
+		/// Refresh stanu SAF przy wczytywaniu zapisu - lżejszy niż pełny Reset
+		/// Przywraca kości do stanu gry bez czyszczenia sesji
+	void Refresh();
 
 		/// Zapis/odczyt stanu animacji (jak w NAF). CreateSaveData wypełnia a_data; LoadSaveData odtwarza grafy i sync.
 		/// Pełna persystencja wymaga zapisu a_data do pliku zapisu (np. SFSE SerializationInterface) po stronie wywołującego.
@@ -108,8 +135,10 @@ namespace Animation
 
 		/// Czy używać ModelDB::GetEntry do ładowania rest pose z NIF rasy.
 		static bool IsModelDBForRestPoseEnabled();
-		/// Address Library ID dla GetModelDBEntry (z INI ModelDBGetEntryID; domyślnie 949826).
+		/// Address Library ID dla GetModelDBEntry (z INI ModelDBGetEntryID; domyślnie 183072, NAF-style).
 		static std::uint64_t GetModelDBGetEntryID();
+		/// Gdy nie 0: GetEntry = base+RVA (legacy API; obecnie domyślnie 0).
+		static std::uint32_t GetModelDBGetEntryRVA();
 		/// Address Library ID dla DecRef (z INI ModelDBDecRefID; domyślnie 36741).
 		static std::uint64_t GetModelDBDecRefID();
 		/// Gdy nie 0: DecRef = base+RVA (z IDA); wtedy drugie ID nie jest potrzebne (z INI ModelDBDecRefRVA).
@@ -120,7 +149,30 @@ namespace Animation
 
 	private:
 		GraphManager() = default;
-		Graph _internalGraph;
-		// TODO: std::unordered_map<RE::FormID, std::unique_ptr<Graph>> _graphs;
+		
+		// Sync groups for synchronized multi-actor playback with shared clock
+		// Maps sync group ID to SyncGroup (shared clock + speed)
+		std::unordered_map<std::uint64_t, std::shared_ptr<SyncGroup>> _syncGroups;
+		
+		// Maps sync group ID to set of actor FormIDs in that group
+		std::unordered_map<std::uint64_t, std::unordered_set<RE::TESFormID>> _syncGroupMembers;
+		
+		// Maps actor FormID to their sync group ID (0 = not synced)
+		std::unordered_map<RE::TESFormID, std::uint64_t> _actorSyncGroupMap;
+		
+		// Next sync group ID for unique identification
+		std::atomic<std::uint64_t> _nextSyncGroupId{ 1 };
+		
+		// Get or create sync group for a set of actors
+		std::shared_ptr<SyncGroup> GetOrCreateSyncGroup(const std::vector<RE::TESFormID>& actorFormIds);
+		
+		// Remove actor from sync group
+		void RemoveActorFromSyncGroup(RE::TESFormID actorFormId);
+		
+		// Check if actor graph is stranded (engine stopped updating it)
+		bool IsActorGraphStranded(RE::TESFormID actorFormId, std::int64_t timeoutMs = 5000) const;
+		
+		// Cleanup stranded graphs
+		void CleanupStrandedGraphs();
 	};
 }
