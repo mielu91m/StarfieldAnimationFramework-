@@ -1,0 +1,24 @@
+#pragma once
+
+#include "FileID.h"
+#include "Generator.h"
+#include <memory>
+
+namespace Animation
+{
+	class IAnimationFile : public std::enable_shared_from_this<IAnimationFile>
+	{
+	public:
+		struct ExtraData
+		{
+			float loadTime = -1.0f;
+			AnimID id;
+		};
+
+		ExtraData extra;
+
+		virtual std::unique_ptr<Generator> CreateGenerator() = 0;
+		virtual size_t GetSizeBytes() = 0;
+		virtual ~IAnimationFile();
+	};
+}
